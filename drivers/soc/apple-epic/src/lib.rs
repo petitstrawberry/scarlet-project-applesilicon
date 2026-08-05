@@ -44,6 +44,7 @@ const EPIC_SERVICE_CALL_MAGIC: u32 = 0x6970_6378;
 
 /// Timeout for EPIC command reply in microseconds.
 const EPIC_REPLY_TIMEOUT_US: u64 = 5_000_000;
+const LOG_CALLBACK_ACKS: bool = false;
 
 // EPIC message types (used as AFK queue entry msg_type).
 const TYPE_NOTIFY: u32 = 0;
@@ -983,10 +984,10 @@ impl EpicEndpoint {
         };
         reply[headers_size..].copy_from_slice(&reply_payload);
 
-        let command = call.command;
-        let request_seq = sub.seq;
         let result = self.afk.lock().send(channel, TYPE_NOTIFY_ACK, &reply);
-        if result.is_ok() {
+        if LOG_CALLBACK_ACKS && result.is_ok() {
+            let command = call.command;
+            let request_seq = sub.seq;
             println!(
                 "[apple-epic] callback ACK queued ch={} command={} rx-seq={} tx-seq={} declared={} available={} data={} reply={}",
                 channel,

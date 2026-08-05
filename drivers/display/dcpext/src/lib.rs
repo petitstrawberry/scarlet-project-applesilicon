@@ -59,6 +59,7 @@ const DCP_IBOOT_SUBTYPE: u16 = 0xc0;
 const DCP_SYSTEM_SET_PROPERTY_SUBTYPE: u16 = 0x43;
 const DCP_SYSLOG_PROPERTY: &[u8] = b"gAFKConfigLogMask";
 const DCP_SYSLOG_MASK: u64 = 0xffff;
+const DCP_DEBUG_LOGGING: bool = false;
 const DCP_SERVICE_TIMEOUT_US: u64 = 5_000_000;
 const DCP_LINK_TIMEOUT_US: u64 = 2_000_000;
 const DPTX_INITIAL_HPD_DELAY_US: u64 = 50_000;
@@ -624,12 +625,14 @@ fn dptx_service_call(
     request: &[u8],
     reply: &mut [u8],
 ) -> Result<(), &'static str> {
-    println!(
-        "[apple-dcpext] DPTX callback command={} request={} reply={}",
-        command,
-        request.len(),
-        reply.len()
-    );
+    if DCP_DEBUG_LOGGING {
+        println!(
+            "[apple-dcpext] DPTX callback command={} request={} reply={}",
+            command,
+            request.len(),
+            reply.len()
+        );
+    }
     let copy_len = request.len().min(reply.len());
     reply[..copy_len].copy_from_slice(&request[..copy_len]);
     let _ = write_le_u32(reply, 0, 0);
@@ -1497,9 +1500,11 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .find_service("system")
         .map(|service| service.channel)
         .ok_or("apple-dcpext: system service channel unavailable")?;
-    rtkit.set_syslog_printing(true);
-    if let Err(error) = enable_dcp_syslog(&mut system, system_channel) {
-        println!("[apple-dcpext] failed to enable DCP syslog: {}", error);
+    if DCP_DEBUG_LOGGING {
+        rtkit.set_syslog_printing(true);
+        if let Err(error) = enable_dcp_syslog(&mut system, system_channel) {
+            println!("[apple-dcpext] failed to enable DCP syslog: {}", error);
+        }
     }
 
     // Both m1n1 and Asahi Linux bring up the iBoot display service before

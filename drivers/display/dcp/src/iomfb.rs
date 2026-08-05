@@ -17,6 +17,7 @@ const ENDPOINT: u8 = 0x37;
 const SHMEM_SIZE: usize = 0x10_0000;
 const PACKET_ALIGNMENT: usize = 0x40;
 const REPLY_TIMEOUT_US: u64 = 5_000_000;
+const LOG_CALLBACK_ACKS: bool = false;
 
 const MESSAGE_TYPE_MASK: u64 = 0xf;
 const MESSAGE_TYPE_SET_SHMEM: u64 = 0;
@@ -247,19 +248,21 @@ impl Iomfb {
                 self.shmem.as_ptr() as usize + base,
                 length,
             );
-            let header = self.packet_header(base)?;
-            let tag = [header.tag[3], header.tag[2], header.tag[1], header.tag[0]];
             self.handle_callback(context, offset, length)?;
-            println!(
-                "[apple-dcp] cooperative IOMFB callback ACK tag={}{}{}{} context={} offset={:#x} length={}",
-                tag[0] as char,
-                tag[1] as char,
-                tag[2] as char,
-                tag[3] as char,
-                context,
-                offset,
-                length
-            );
+            if LOG_CALLBACK_ACKS {
+                let header = self.packet_header(base)?;
+                let tag = [header.tag[3], header.tag[2], header.tag[1], header.tag[0]];
+                println!(
+                    "[apple-dcp] cooperative IOMFB callback ACK tag={}{}{}{} context={} offset={:#x} length={}",
+                    tag[0] as char,
+                    tag[1] as char,
+                    tag[2] as char,
+                    tag[3] as char,
+                    context,
+                    offset,
+                    length
+                );
+            }
         }
         Ok(true)
     }

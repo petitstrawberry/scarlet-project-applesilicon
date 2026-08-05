@@ -31,9 +31,10 @@ use scarlet::{
     early_println,
     interrupt::InterruptId,
     mem::pmm,
-    sync::Mutex,
+    sync::IrqSpinLock,
 };
 use scarlet_driver_apple_atcphy::get_atcphy_by_phandle;
+use scarlet_driver_apple_cd321x::{Cd321xDisplayPortLaneMode, displayport_lane_mode};
 
 const DWC3_GUSB2PHYCFG: usize = 0xc200;
 const DWC3_GCTL: usize = 0xc110;
@@ -368,6 +369,13 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     };
     if let Some(phy) = &usb3_phy {
         apply_typec_orientation(phy, typec_status.map(|status| status.orientation))?;
+        if let Some(mode) = typec_atc_mode(typec_status.as_ref())? {
+            phy.set_mode(mode).map_err(phy_error_to_str)?;
+            early_println!(
+                "[apple-dwc3] usb3-phy selected {:?} before DWC3 startup",
+                mode
+            );
+        }
         phy.power_on().map_err(phy_error_to_str)?;
         early_println!("[apple-dwc3] usb3-phy powered before reset deassert");
     }
@@ -479,6 +487,19 @@ fn apply_typec_orientation(
     Ok(())
 }
 
+fn typec_atc_mode(status: Option<&TypecPortStatus>) -> Result<Option<PhyMode>, &'static str> {
+    let Some(status) = status else {
+        return Ok(None);
+    };
+    let mode = match displayport_lane_mode(status)? {
+        None => return Ok(None),
+        Some(Cd321xDisplayPortLaneMode::DisplayPort) => PhyMode::DisplayPort,
+        Some(Cd321xDisplayPortLaneMode::Usb3DisplayPort) => PhyMode::Other(1),
+    };
+
+    Ok(Some(mode))
+}
+
 fn prepare_phy(
     device: &PlatformDeviceInfo,
     name: &'static str,
@@ -532,7 +553,7 @@ fn remove_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     Ok(())
 }
 
-static APPLE_DWC3: Mutex<Vec<AppleDwc3>> = Mutex::new(Vec::new());
+static APPLE_DWC3: IrqSpinLock<Vec<AppleDwc3>> = IrqSpinLock::new(Vec::new());
 
 fn register_dwc3_driver() {
     let driver = PlatformDeviceDriver::new(

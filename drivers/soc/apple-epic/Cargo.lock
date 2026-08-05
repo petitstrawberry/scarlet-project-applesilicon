@@ -61,12 +61,13 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "0.16.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#76404679e604ba72ba1560fd690e62a2636be6a7"
 dependencies = [
  "fdt",
  "font8x8",
  "hashbrown",
  "limine",
- "spin",
+ "lock_api",
  "talc",
 ]
 
@@ -106,15 +107,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "spin"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
-dependencies = [
- "lock_api",
-]
 
 [[package]]
 name = "talc"

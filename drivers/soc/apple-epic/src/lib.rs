@@ -19,7 +19,7 @@ use core::mem;
 use scarlet::device::remoteproc::RemoteProcessor;
 use scarlet::early_println;
 use scarlet::mem::pmm;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 use scarlet::time;
 use scarlet::vm;
 use scarlet_driver_apple_afk::AfkEndpoint;
@@ -64,9 +64,6 @@ const SUBTYPE_RETCODE: u16 = 0x84;
 const SUBTYPE_STRING: u16 = 0x8a;
 const SUBTYPE_STD_SERVICE: u16 = 0xc0;
 
-// Flags.
-const FLAG_INLINE: u8 = 0x08;
-
 #[inline(always)]
 fn dma_clean(vaddr: usize, len: usize) {
     scarlet::arch::clean_dcache_to_poc_range(vaddr, len);
@@ -100,8 +97,10 @@ struct EpicSubHdr {
     msg_type: u16,
     timestamp: u64,
     seq: u16,
-    unk: u8,
-    flags: u8,
+    // Fairydust and m1n1 model this as one opaque little-endian u16.
+    // Setting a synthetic high-byte "flags" field changes the callback ACK
+    // wire value from the upstream protocol's 0x0000 to 0x0800.
+    unk: u16,
     inline_len: u32,
 }
 
@@ -127,6 +126,25 @@ struct EpicServiceCall {
     magic: u32,
     _pad1: [u8; 48],
 }
+
+/// Standard service call issued by the coprocessor to the application
+/// processor.  Despite sharing the same subtype as [`EpicServiceCall`], the
+/// callback header has a different layout.
+#[repr(C, packed)]
+struct EpicServiceApCall {
+    _unk0: u32,
+    _unk1: u32,
+    command: u32,
+    data_len: u32,
+    _magic: u32,
+    _unk2: [u8; 48],
+}
+
+/// Handler for an inline standard-service call made by DCP firmware.
+///
+/// The handler receives the announced service channel, command number,
+/// request bytes, and a zero-filled reply buffer of the same length.
+pub type EpicServiceCallHandler = fn(u32, u32, &[u8], &mut [u8]) -> Result<(), &'static str>;
 
 /// EPIC service announcement payload.
 ///
@@ -244,7 +262,7 @@ pub struct EpicService {
 /// EPIC endpoint — manages service discovery and command/reply messaging
 /// on top of an AFK endpoint.
 pub struct EpicEndpoint {
-    afk: Arc<Mutex<AfkEndpoint>>,
+    afk: Arc<IrqSpinLock<AfkEndpoint>>,
     dma: EpicDmaBuffer,
     /// Outgoing EPIC-level sequence number.
     seq: u16,
@@ -252,6 +270,8 @@ pub struct EpicEndpoint {
     services: Vec<EpicService>,
     /// Callback for received notifications (channel, subtype, data).
     notify_handler: Option<fn(u32, u16, &[u8])>,
+    /// Callback for coprocessor-initiated standard service calls.
+    service_call_handler: Option<EpicServiceCallHandler>,
 }
 
 impl EpicEndpoint {
@@ -266,7 +286,7 @@ impl EpicEndpoint {
     ///
     /// A started EPIC endpoint ready for service discovery and commands.
     pub fn new(remoteproc: Arc<dyn RemoteProcessor>, endpoint: u8) -> Result<Self, &'static str> {
-        let afk = Arc::new(Mutex::new(AfkEndpoint::new(remoteproc, endpoint)?));
+        let afk = Arc::new(IrqSpinLock::new(AfkEndpoint::new(remoteproc, endpoint)?));
         afk.lock().start()?;
         Self::from_afk(afk)
     }
@@ -282,7 +302,7 @@ impl EpicEndpoint {
     /// # Returns
     ///
     /// An EPIC endpoint using the supplied AFK transport.
-    pub fn from_afk(afk: Arc<Mutex<AfkEndpoint>>) -> Result<Self, &'static str> {
+    pub fn from_afk(afk: Arc<IrqSpinLock<AfkEndpoint>>) -> Result<Self, &'static str> {
         let remoteproc = afk.lock().remoteproc();
         let dma = EpicDmaBuffer::alloc(remoteproc)?;
 
@@ -299,6 +319,7 @@ impl EpicEndpoint {
             seq: 0,
             services: Vec::new(),
             notify_handler: None,
+            service_call_handler: None,
         })
     }
 
@@ -307,6 +328,14 @@ impl EpicEndpoint {
     /// Called when a `TYPE_NOTIFY` is received that is not a service announcement.
     pub fn set_notify_handler(&mut self, handler: fn(u32, u16, &[u8])) {
         self.notify_handler = Some(handler);
+    }
+
+    /// Register a handler for inline standard-service calls made by firmware.
+    ///
+    /// These calls can arrive while a host-issued command is waiting for its
+    /// reply, so the endpoint dispatches and acknowledges them synchronously.
+    pub fn set_service_call_handler(&mut self, handler: EpicServiceCallHandler) {
+        self.service_call_handler = Some(handler);
     }
 
     /// Poll for incoming messages and dispatch them.
@@ -404,6 +433,17 @@ impl EpicEndpoint {
             .find(|s| s.name.starts_with(name_prefix))
     }
 
+    /// Find a discovered service by the end of its announced name.
+    ///
+    /// DCPext prefixes DPTX service names with the display instance, for
+    /// example `dispext0:dcpdptx-port-epic:0`. A suffix lookup lets callers
+    /// select a specific DPTX port without depending on that instance prefix.
+    pub fn find_service_by_suffix(&self, name_suffix: &str) -> Option<&EpicService> {
+        self.services
+            .iter()
+            .find(|service| service.name.ends_with(name_suffix))
+    }
+
     /// Find a discovered service by channel number.
     pub fn find_service_by_channel(&self, channel: u32) -> Option<&EpicService> {
         self.services.iter().find(|s| s.channel == channel)
@@ -461,7 +501,29 @@ impl EpicEndpoint {
         data: &[u8],
     ) -> Result<Vec<u8>, &'static str> {
         self.send_command(channel, group, command, data)?;
-        self.wait_reply(channel, SUBTYPE_STD_SERVICE)
+        let reply = self.wait_reply(channel, SUBTYPE_STD_SERVICE)?;
+        self.parse_service_reply(&reply, group, command, None)
+    }
+
+    /// Send a standard service call with firmware-specific request and reply
+    /// padding sizes.
+    ///
+    /// DCP's DPTX interface includes the padding in `data_len` and requires
+    /// the DMA transfer to be large enough for either direction. `data` is
+    /// copied at the start of the zero-filled request area; returned padding
+    /// is omitted from the result.
+    pub fn call_by_channel_sized(
+        &mut self,
+        channel: u32,
+        group: u16,
+        command: u32,
+        data: &[u8],
+        request_size: usize,
+        response_size: usize,
+    ) -> Result<Vec<u8>, &'static str> {
+        self.send_standard_command(channel, group, command, data, request_size, response_size)?;
+        let reply = self.wait_reply(channel, SUBTYPE_STD_SERVICE)?;
+        self.parse_service_reply(&reply, group, command, Some(response_size))
     }
 
     /// Send a raw EPIC command and wait for its DMA reply.
@@ -497,7 +559,25 @@ impl EpicEndpoint {
         command: u32,
         data: &[u8],
     ) -> Result<(), &'static str> {
-        let total = mem::size_of::<EpicServiceCall>() + data.len();
+        self.send_standard_command(channel, group, command, data, data.len(), data.len())
+    }
+
+    fn send_standard_command(
+        &mut self,
+        channel: u32,
+        group: u16,
+        command: u32,
+        data: &[u8],
+        request_size: usize,
+        response_size: usize,
+    ) -> Result<(), &'static str> {
+        if data.len() > request_size {
+            return Err("apple-epic: request exceeds declared request size");
+        }
+        let transfer_size = request_size.max(response_size);
+        let total = mem::size_of::<EpicServiceCall>()
+            .checked_add(transfer_size)
+            .ok_or("apple-epic: command size overflow")?;
         if total > EPIC_BUFFER_SIZE {
             return Err("apple-epic: command data too large");
         }
@@ -506,14 +586,16 @@ impl EpicEndpoint {
             _pad0: [0; 2],
             group,
             command,
-            data_len: data.len() as u32,
+            data_len: request_size as u32,
             magic: EPIC_SERVICE_CALL_MAGIC,
             _pad1: [0; 48],
         };
 
-        // Write service call header + data to TX DMA buffer
+        // The firmware may use the tail as either request padding or reply
+        // space, so clear the complete bidirectional transfer area.
         unsafe {
             let dst = self.dma.tx_virt as *mut u8;
+            core::ptr::write_bytes(dst, 0, total);
             core::ptr::copy_nonoverlapping(
                 &call as *const EpicServiceCall as *const u8,
                 dst,
@@ -657,7 +739,7 @@ impl EpicEndpoint {
     }
 
     /// Get the underlying AFK endpoint reference.
-    pub fn afk(&self) -> &Arc<Mutex<AfkEndpoint>> {
+    pub fn afk(&self) -> &Arc<IrqSpinLock<AfkEndpoint>> {
         &self.afk
     }
 
@@ -696,7 +778,6 @@ impl EpicEndpoint {
             timestamp: 0,
             seq: sub_seq,
             unk: 0,
-            flags: 0,
             inline_len: 0,
         };
 
@@ -760,12 +841,12 @@ impl EpicEndpoint {
                 self.handle_announce(channel, payload);
             }
             (CAT_NOTIFY, SUBTYPE_STD_SERVICE) => {
-                // Standard service notification — forward to handler
-                if let Some(handler) = self.notify_handler {
-                    let data_start = mem::size_of::<EpicHdr>() + mem::size_of::<EpicSubHdr>();
-                    if payload.len() > data_start {
-                        handler(channel, sub.msg_type, &payload[data_start..]);
-                    }
+                if let Err(error) = self.handle_service_call(channel, &sub, payload) {
+                    early_println!(
+                        "[apple-epic] standard service callback failed on ch={}: {}",
+                        channel,
+                        error
+                    );
                 }
             }
             _ => {
@@ -777,6 +858,79 @@ impl EpicEndpoint {
                 }
             }
         }
+    }
+
+    fn handle_service_call(
+        &mut self,
+        channel: u32,
+        sub: &EpicSubHdr,
+        payload: &[u8],
+    ) -> Result<(), &'static str> {
+        let Some(handler) = self.service_call_handler else {
+            return Err("apple-epic: no standard service callback handler");
+        };
+        let data_start = mem::size_of::<EpicHdr>() + mem::size_of::<EpicSubHdr>();
+        let available = payload
+            .len()
+            .checked_sub(data_start)
+            .ok_or("apple-epic: truncated inline service call")?;
+        let payload_size = (sub.length as usize).min(available);
+        if payload_size < mem::size_of::<EpicServiceApCall>() {
+            return Err("apple-epic: inline service call header is truncated");
+        }
+
+        let call: EpicServiceApCall = unsafe {
+            core::ptr::read_unaligned(payload.as_ptr().add(data_start) as *const EpicServiceApCall)
+        };
+        let call_size = call.data_len as usize;
+        if mem::size_of::<EpicServiceApCall>()
+            .checked_add(call_size)
+            .ok_or("apple-epic: inline service call size overflow")?
+            > payload_size
+        {
+            return Err("apple-epic: inline service call data is truncated");
+        }
+
+        let request_start = data_start + mem::size_of::<EpicServiceApCall>();
+        let request = &payload[request_start..request_start + call_size];
+        let mut reply_payload = alloc::vec![0u8; payload_size];
+        reply_payload[..mem::size_of::<EpicServiceApCall>()].copy_from_slice(
+            &payload[data_start..data_start + mem::size_of::<EpicServiceApCall>()],
+        );
+        let reply_start = mem::size_of::<EpicServiceApCall>();
+        handler(
+            channel,
+            call.command,
+            request,
+            &mut reply_payload[reply_start..reply_start + call_size],
+        )?;
+
+        let headers_size = mem::size_of::<EpicHdr>() + mem::size_of::<EpicSubHdr>();
+        let mut reply = alloc::vec![0u8; headers_size + payload_size];
+        let header_seq = self.next_seq();
+        self.write_epic_headers(
+            &mut reply,
+            CAT_REPLY,
+            SUBTYPE_STD_SERVICE,
+            header_seq,
+            sub.seq,
+            payload_size as u32,
+        );
+        let mut reply_sub: EpicSubHdr = unsafe {
+            core::ptr::read_unaligned(
+                reply.as_ptr().add(mem::size_of::<EpicHdr>()) as *const EpicSubHdr
+            )
+        };
+        reply_sub.inline_len = payload_size.saturating_sub(4) as u32;
+        unsafe {
+            core::ptr::write_unaligned(
+                reply.as_mut_ptr().add(mem::size_of::<EpicHdr>()) as *mut EpicSubHdr,
+                reply_sub,
+            )
+        };
+        reply[headers_size..].copy_from_slice(&reply_payload);
+
+        self.afk.lock().send(channel, TYPE_NOTIFY_ACK, &reply)
     }
 
     fn handle_announce(&mut self, channel: u32, payload: &[u8]) {
@@ -874,6 +1028,33 @@ impl EpicEndpoint {
             unsafe { core::slice::from_raw_parts(self.dma.rx_virt as *const u8, rx_len) };
 
         Ok(reply_data.to_vec())
+    }
+
+    fn parse_service_reply(
+        &self,
+        reply: &[u8],
+        group: u16,
+        command: u32,
+        response_size: Option<usize>,
+    ) -> Result<Vec<u8>, &'static str> {
+        if reply.len() < mem::size_of::<EpicServiceCall>() {
+            return Err("apple-epic: standard service reply is truncated");
+        }
+        let call: EpicServiceCall =
+            unsafe { core::ptr::read_unaligned(reply.as_ptr() as *const EpicServiceCall) };
+        if call.magic != EPIC_SERVICE_CALL_MAGIC || call.group != group || call.command != command {
+            return Err("apple-epic: standard service reply header mismatch");
+        }
+        let declared = call.data_len as usize;
+        let available = reply.len() - mem::size_of::<EpicServiceCall>();
+        let length = response_size
+            .unwrap_or(declared)
+            .min(declared)
+            .min(available);
+        Ok(
+            reply[mem::size_of::<EpicServiceCall>()..mem::size_of::<EpicServiceCall>() + length]
+                .to_vec(),
+        )
     }
 }
 

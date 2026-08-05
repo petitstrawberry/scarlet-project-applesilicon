@@ -9,3 +9,4 @@ path = "src/lib.rs"
 [dependencies]
 scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }
 scarlet-driver-apple-atcphy = { path = "../../../phy/apple-atcphy" }
+scarlet-driver-apple-cd321x = { path = "../../typec/apple-cd321x" }

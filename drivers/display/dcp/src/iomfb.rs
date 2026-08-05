@@ -106,6 +106,16 @@ pub struct BandwidthRegisters {
     pub doorbell_bit: u32,
 }
 
+/// Destination rectangle used when the DCP compositor scales a scanout
+/// surface onto the physical panel.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 fn bytes_of<T>(value: &T) -> &[u8] {
     // SAFETY: wire values are packed POD and the slice does not outlive `value`.
     unsafe { core::slice::from_raw_parts(value as *const T as *const u8, mem::size_of::<T>()) }
@@ -1007,9 +1017,10 @@ impl Iomfb {
     ///
     /// * `swap_id` - Identifier returned by [`Self::swap_start`].
     /// * `surface_dva` - DCP-visible address of the surface.
-    /// * `width` - Surface and destination width.
-    /// * `height` - Surface and destination height.
+    /// * `width` - Source surface width.
+    /// * `height` - Source surface height.
     /// * `stride` - Surface row stride in bytes.
+    /// * `destination` - Scaled destination rectangle on the physical panel.
     ///
     /// # Returns
     ///
@@ -1022,6 +1033,7 @@ impl Iomfb {
         width: u32,
         height: u32,
         stride: u32,
+        destination: OutputRect,
     ) -> Result<(), &'static str> {
         let (submit_size, surface_size, surfaces_offset, surface_iova_offset) =
             if self.firmware_12_3 {
@@ -1045,10 +1057,10 @@ impl Iomfb {
         write_u32(&mut request, 136, 0);
         write_u32(&mut request, 140, width);
         write_u32(&mut request, 144, height);
-        write_u32(&mut request, 228, 0);
-        write_u32(&mut request, 232, 0);
-        write_u32(&mut request, 236, width);
-        write_u32(&mut request, 240, height);
+        write_u32(&mut request, 228, destination.x);
+        write_u32(&mut request, 232, destination.y);
+        write_u32(&mut request, 236, destination.width);
+        write_u32(&mut request, 240, destination.height);
         let clear_boot_surfaces = !self.surfaces_cleared;
         let swap_mask = if clear_boot_surfaces {
             SWAP_SET_BACKGROUND | 0x7

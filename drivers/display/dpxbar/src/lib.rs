@@ -13,7 +13,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::device::DeviceInfo;
 use scarlet::device::manager::{DeviceManager, DriverPriority};
@@ -66,14 +66,16 @@ pub enum DpxbarPort {
 }
 
 pub struct AppleDpxbar {
+    paddr: usize,
     base: usize,
     selected_dispext: [i32; MUX_MAX],
     n_ufp: u32,
 }
 
 impl AppleDpxbar {
-    fn new(base: usize, n_ufp: u32) -> Self {
+    fn new(paddr: usize, base: usize, n_ufp: u32) -> Self {
         Self {
+            paddr,
             base,
             selected_dispext: [-1; MUX_MAX],
             n_ufp,
@@ -273,7 +275,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let (paddr, size) = dpxbar_resource(device)?;
     let base = vm::ioremap(paddr, size).map_err(|_| "apple-dpxbar: failed to map MMIO")?;
 
-    let mut dpxbar = AppleDpxbar::new(base, 2);
+    let mut dpxbar = AppleDpxbar::new(paddr, base, 2);
 
     if is_t8103(device) {
         let tunable = read32(base, UNK_TUNABLE);
@@ -295,20 +297,65 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         dpxbar.n_ufp
     );
 
-    *DPXBAR.lock() = Some(dpxbar);
+    let mut registry = DPXBAR.lock();
+    if let Some(existing) = registry.iter_mut().find(|entry| entry.paddr == paddr) {
+        *existing = dpxbar;
+    } else {
+        registry.push(dpxbar);
+    }
     Ok(())
 }
 
-fn remove_fn(_device: &PlatformDeviceInfo) -> Result<(), &'static str> {
-    *DPXBAR.lock() = None;
+fn remove_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
+    if let Ok((paddr, _)) = dpxbar_resource(device) {
+        DPXBAR.lock().retain(|entry| entry.paddr != paddr);
+    }
     Ok(())
 }
 
-static DPXBAR: Mutex<Option<AppleDpxbar>> = Mutex::new(None);
+static DPXBAR: IrqSpinLock<Vec<AppleDpxbar>> = IrqSpinLock::new(Vec::new());
 
 pub fn with_dpxbar<R>(f: impl FnOnce(&mut AppleDpxbar) -> R) -> Option<R> {
     let mut guard = DPXBAR.lock();
-    guard.as_mut().map(f)
+    guard.first_mut().map(f)
+}
+
+/// Lazily map a t8103 ATC display crossbar and route its DPPHY input to
+/// external-display state 0.
+///
+/// Apple's boot FDT does not always contain standalone crossbar nodes.  The
+/// register block is nevertheless fixed at `ATC core + 0x4c000`, so the ATC
+/// provider can supply its physical address directly.
+pub fn route_t8103_dpphy(crossbar_paddr: usize) -> Result<(), &'static str> {
+    const T8103_CROSSBAR_SIZE: usize = 0x4000;
+
+    let mut registry = DPXBAR.lock();
+    if registry.iter().all(|entry| entry.paddr != crossbar_paddr) {
+        let base = vm::ioremap(crossbar_paddr, T8103_CROSSBAR_SIZE)
+            .map_err(|_| "apple-dpxbar: failed to map t8103 ATC crossbar")?;
+        let mut crossbar = AppleDpxbar::new(crossbar_paddr, base, 2);
+        let before = read32(base, UNK_TUNABLE);
+        write32(base, UNK_TUNABLE, 0);
+        crossbar.disconnect_all();
+        early_println!(
+            "[apple-dpxbar] lazily mapped t8103 crossbar paddr={:#x}, tunable={:#x}->0",
+            crossbar_paddr,
+            before
+        );
+        registry.push(crossbar);
+    }
+
+    let crossbar = registry
+        .iter_mut()
+        .find(|entry| entry.paddr == crossbar_paddr)
+        .ok_or("apple-dpxbar: crossbar registry failure")?;
+    crossbar.set_port(DpxbarPort::DpPhy, Some(0))?;
+    early_println!(
+        "[apple-dpxbar] routed dpphy to dispext0 at paddr={:#x}",
+        crossbar_paddr
+    );
+    crossbar.log_status();
+    Ok(())
 }
 
 fn register_dpxbar_driver() {
@@ -329,7 +376,7 @@ fn register_dpxbar_driver() {
 scarlet::driver_initcall!(register_dpxbar_driver);
 
 #[used]
-static SCARLET_DRIVER_DPXBAR_ANCHOR: fn() = force_link;
+static SCARLET_DRIVER_APPLE_DPXBAR_ANCHOR: fn() = force_link;
 
 #[inline(never)]
 pub fn force_link() {}

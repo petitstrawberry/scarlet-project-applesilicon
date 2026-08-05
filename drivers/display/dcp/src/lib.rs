@@ -17,7 +17,7 @@ extern crate alloc;
 
 mod iomfb;
 
-use iomfb::{BandwidthRegisters, Iomfb};
+use iomfb::{BandwidthRegisters, Iomfb, OutputRect};
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -38,13 +38,14 @@ use scarlet::mem::page::ContiguousPages;
 use scarlet::object::capability::selectable::{ReadyInterest, SelectWaitOutcome, Selectable};
 use scarlet::object::capability::{ControlOps, MemoryMappingOps};
 use scarlet::println;
-use scarlet::sync::Mutex;
+use scarlet::sync::{IrqSpinLock, Mutex};
 use scarlet::vm::vmem::MemoryAttribute;
 use scarlet::{arch, environment, time};
 use scarlet_driver_apple_asc::get_apple_asc_by_phandle;
 use scarlet_driver_apple_dart::{DartDomain, DartInstance, DartPageTable, get_dart_by_phandle};
 use scarlet_driver_apple_epic::EpicEndpoint;
 use scarlet_driver_apple_rtkit::AppleRtkit;
+use scarlet_driver_dcpext::{configure_mirror_scanouts, mirror_mode, present_mirror_buffer};
 
 const DCP_IBOOT_EP: u8 = 0x23;
 const DCP_IBOOT_SUBTYPE: u16 = 0xc0;
@@ -356,7 +357,7 @@ fn map_handoff_regions(
 }
 
 struct DcpDmaMapper {
-    table: Arc<Mutex<DartPageTable>>,
+    table: Arc<IrqSpinLock<DartPageTable>>,
     dart: Arc<DartInstance>,
     next_iova: AtomicUsize,
     page_size: usize,
@@ -365,7 +366,7 @@ struct DcpDmaMapper {
 
 impl DcpDmaMapper {
     fn new(
-        table: Arc<Mutex<DartPageTable>>,
+        table: Arc<IrqSpinLock<DartPageTable>>,
         dart: Arc<DartInstance>,
         page_size: usize,
         dva_base: u64,
@@ -588,10 +589,38 @@ fn choose_color(modes: &[DcpColorMode]) -> Option<DcpColorMode> {
         .max_by_key(|mode| (mode.bpp <= 32, mode.bpp))
 }
 
+fn fit_output_rect(
+    source_width: u32,
+    source_height: u32,
+    panel_width: u32,
+    panel_height: u32,
+) -> OutputRect {
+    let source_wider =
+        panel_width as u64 * source_height as u64 <= panel_height as u64 * source_width as u64;
+    let (width, height) = if source_wider {
+        (
+            panel_width,
+            ((source_height as u64 * panel_width as u64) / source_width as u64).max(1) as u32,
+        )
+    } else {
+        (
+            ((source_width as u64 * panel_height as u64) / source_height as u64).max(1) as u32,
+            panel_height,
+        )
+    };
+    OutputRect {
+        x: panel_width.saturating_sub(width) / 2,
+        y: panel_height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
 struct DcpState {
     _iboot: DcpIboot,
     iomfb: Iomfb,
     front: usize,
+    destination: OutputRect,
 }
 
 pub struct AppleDcpGraphics {
@@ -600,12 +629,25 @@ pub struct AppleDcpGraphics {
     scanout_dva: [u64; 2],
     state: Mutex<DcpState>,
     _rtkit: Arc<AppleRtkit>,
-    _dcp_table: Arc<Mutex<DartPageTable>>,
-    _display_table: Arc<Mutex<DartPageTable>>,
+    _dcp_table: Arc<IrqSpinLock<DartPageTable>>,
+    _display_table: Arc<IrqSpinLock<DartPageTable>>,
     _piodma_domain: Arc<DartDomain>,
+    external_mirror: bool,
 }
 
 impl AppleDcpGraphics {
+    fn present_external_mirror(&self, index: usize) {
+        if !self.external_mirror {
+            return;
+        }
+        if let Err(error) = present_mirror_buffer(index) {
+            // Keep the internal panel alive if the boot-time external link is
+            // lost. Runtime connector recovery belongs to the future hotplug
+            // path and must not stall the compositor.
+            println!("[apple-dcp] external mirror present failed: {}", error);
+        }
+    }
+
     fn clean_scanout_regions(
         &self,
         scanout: &ContiguousPages,
@@ -709,6 +751,8 @@ impl GraphicsDevice for AppleDcpGraphics {
         }
 
         self.clean_scanout_regions(&self.scanout[back], &[])?;
+        self.present_external_mirror(back);
+        let destination = state.destination;
         let swap_id = state.iomfb.swap_start()?;
         state.iomfb.swap_submit(
             swap_id,
@@ -716,6 +760,7 @@ impl GraphicsDevice for AppleDcpGraphics {
             self.config.width,
             self.config.height,
             self.config.stride,
+            destination,
         )?;
         state.iomfb.wait_swap_complete(swap_id)?;
         state.front = back;
@@ -765,6 +810,8 @@ impl GraphicsDevice for AppleDcpGraphics {
         }
 
         self.clean_scanout_regions(scanout, regions)?;
+        self.present_external_mirror(index);
+        let destination = state.destination;
         let swap_id = state.iomfb.swap_start()?;
         state.iomfb.swap_submit(
             swap_id,
@@ -772,6 +819,7 @@ impl GraphicsDevice for AppleDcpGraphics {
             self.config.width,
             self.config.height,
             self.config.stride,
+            destination,
         )?;
         state.iomfb.wait_swap_complete(swap_id)?;
         state.front = index;
@@ -871,11 +919,11 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let display_root = display_dart
         .ttbr_paddr(display_stream)
         .ok_or("apple-dcp: display DART has no valid TTBR")?;
-    let dcp_table = Arc::new(Mutex::new(DartPageTable::wrap_existing(
+    let dcp_table = Arc::new(IrqSpinLock::new(DartPageTable::wrap_existing(
         dcp_root,
         dcp_dart.page_shift(),
     )?));
-    let display_table = Arc::new(Mutex::new(DartPageTable::wrap_existing(
+    let display_table = Arc::new(IrqSpinLock::new(DartPageTable::wrap_existing(
         display_root,
         display_dart.page_shift(),
     )?));
@@ -963,12 +1011,20 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let color = choose_color(&iboot.color_modes()?).ok_or("apple-dcp: no usable color mode")?;
     iboot.set_mode(&timing, &color)?;
 
+    let panel_width = timing.width;
+    let panel_height = timing.height;
+    let external_mode = mirror_mode();
+    let canvas_width = external_mode.map(|mode| mode.width).unwrap_or(panel_width);
+    let canvas_height = external_mode
+        .map(|mode| mode.height)
+        .unwrap_or(panel_height);
     let config = FramebufferConfig {
-        width: timing.width,
-        height: timing.height,
+        width: canvas_width,
+        height: canvas_height,
         format: PixelFormat::BGRA8888,
-        stride: timing.width.saturating_mul(4),
+        stride: canvas_width.saturating_mul(4),
     };
+    let destination = fit_output_rect(config.width, config.height, panel_width, panel_height);
     let visible_size = config.size();
     let allocation_size = visible_size
         .checked_add(24 * page_size)
@@ -1018,6 +1074,27 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         .sync_page_tables()
         .map_err(|_| "apple-dcp: display scanout DART sync failed")?;
 
+    let external_mirror = if external_mode.is_some() {
+        match configure_mirror_scanouts(
+            &config,
+            [
+                (scanout0.as_paddr(), allocation_size),
+                (scanout1.as_paddr(), allocation_size),
+            ],
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                println!(
+                    "[apple-dcp] external scanout sharing failed; continuing internal-only: {}",
+                    error
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     arch::io_wmb();
     iboot.set_surface(&make_layer(&config, scanout_dva[0]))?;
     let (registers, bandwidth) = iomfb_registers(device)?;
@@ -1060,11 +1137,13 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
             _iboot: iboot,
             iomfb,
             front: 0,
+            destination,
         }),
         _rtkit: rtkit,
         _dcp_table: dcp_table,
         _display_table: display_table,
         _piodma_domain: piodma_domain,
+        external_mirror,
     });
     let device_id = DeviceManager::get_manager()
         .register_device_with_name(alloc::string::String::from("apple-dcp"), graphics.clone());
@@ -1080,11 +1159,18 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     }
 
     println!(
-        "[apple-dcp] native panel {}x{} @ {}.{:02} Hz, handoff maps dcp={} display={}",
-        config.width,
-        config.height,
+        "[apple-dcp] panel {}x{} @ {}.{:02} Hz, canvas={}x{}, internal dst={}x{}+{},{} external-mirror={}, handoff maps dcp={} display={}",
+        panel_width,
+        panel_height,
         timing.fps >> 16,
         ((timing.fps & 0xffff) * 100 + 0x7fff) >> 16,
+        config.width,
+        config.height,
+        destination.width,
+        destination.height,
+        destination.x,
+        destination.y,
+        external_mirror,
         dcp_handoff,
         display_handoff
     );
@@ -1102,7 +1188,8 @@ fn register_driver() {
         remove_fn,
         alloc::vec!["apple,t8103-dcp", "apple,dcp"],
     );
-    DeviceManager::get_manager().register_driver(Box::new(driver), DriverPriority::Standard);
+    // DCPext (Standard) must select the shared mirror canvas first.
+    DeviceManager::get_manager().register_driver(Box::new(driver), DriverPriority::Late);
 }
 
 scarlet::driver_initcall!(register_driver);

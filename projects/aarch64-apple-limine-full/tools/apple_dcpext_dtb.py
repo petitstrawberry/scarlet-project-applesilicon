@@ -3,9 +3,10 @@
 """Patch J293 Type-C DCPext topology into an m1n1 payload DTB.
 
 The stock J293 DTB already contains DCPext, its mailbox, and both DARTs, but
-keeps them disabled and does not connect DCPext to the front Type-C port.
-This helper applies the fixed fairydust-style J293 topology before stage-2
-m1n1 consumes the DTB.  No information is taken from the live ADT.
+keeps them disabled and does not expose either Type-C connector to DCPext.
+This helper enables the common display resources and advertises both ports;
+the Scarlet driver then selects the controller that negotiated DP Alt Mode.
+No information is taken from the live ADT.
 """
 
 from __future__ import annotations
@@ -21,20 +22,31 @@ from typing import Any
 
 FDT_MAGIC = b"\xd0\r\xfe\xed"
 SUPPORTED_MACHINE = "j293"
-PHY_TYPE_DP = 6
 
 ALIASES_PATH = "/aliases"
-SOC_PATH = "/soc"
 DISPLAY_PATH = "/soc/display-subsystem"
 DISP0_DART_PATH = "/soc/iommu@231304000"
 DISPEXT0_DART_PATH = "/soc/iommu@271304000"
 DCPEXT_DART_PATH = "/soc/iommu@27130c000"
 DCPEXT_MBOX_PATH = "/soc/mbox@271c08000"
 DCPEXT_PATH = "/soc/dcp@271c00000"
+ATCPHY0_PATH = "/soc/phy@383000000"
 ATCPHY1_PATH = "/soc/phy@503000000"
-ATCPHY1_XBAR_PATH = "/soc/mux@50304c000"
+TYPEC0_PATH = "/soc/i2c@235010000/usb-pd@38/connector"
 TYPEC1_PATH = "/soc/i2c@235010000/usb-pd@3f/connector"
+ATC0_COMMON_PATH = "/soc/power-management@23b700000/power-controller@420"
 ATC1_COMMON_PATH = "/soc/power-management@23b700000/power-controller@448"
+
+# These properties used to bind DCPext to ATC1 before its driver probe.  That
+# prevents the rear port from ever reaching the driver's runtime route
+# selection when firmware leaves only ATC0 enabled.
+LEGACY_FIXED_ROUTE_PROPERTIES = (
+    "phys",
+    "phy-names",
+    "mux-controls",
+    "mux-control-names",
+    "mux-index",
+)
 
 
 class DcpextDtbError(RuntimeError):
@@ -121,8 +133,11 @@ def _require_j293_nodes(dtb: pathlib.Path) -> None:
         DCPEXT_DART_PATH,
         DCPEXT_MBOX_PATH,
         DCPEXT_PATH,
+        ATCPHY0_PATH,
         ATCPHY1_PATH,
+        TYPEC0_PATH,
         TYPEC1_PATH,
+        ATC0_COMMON_PATH,
         ATC1_COMMON_PATH,
     ):
         if not _node_exists(dtb, path):
@@ -138,30 +153,26 @@ def dtb_has_dcpext(dtb: pathlib.Path) -> bool:
         dispext0_dart = _phandle(dtb, DISPEXT0_DART_PATH)
         dcpext_dart = _phandle(dtb, DCPEXT_DART_PATH)
         dcpext_mbox = _phandle(dtb, DCPEXT_MBOX_PATH)
-        atcphy1 = _phandle(dtb, ATCPHY1_PATH)
-        xbar = _phandle(dtb, ATCPHY1_XBAR_PATH)
     except DcpextDtbError:
         return False
 
     expected_status = (DISPEXT0_DART_PATH, DCPEXT_DART_PATH, DCPEXT_MBOX_PATH, DCPEXT_PATH)
     return (
         _string_property(dtb, ALIASES_PATH, "dcpext") == DCPEXT_PATH
+        and _cells_property(dtb, TYPEC0_PATH, "displayport") == [dcpext]
         and _cells_property(dtb, TYPEC1_PATH, "displayport") == [dcpext]
         and _cells_property(dtb, DISPLAY_PATH, "iommus")
         == [disp0_dart, 0, dispext0_dart, 0]
         and all(_string_property(dtb, path, "status") == "okay" for path in expected_status)
         and _string_property(dtb, DCPEXT_PATH, "apple,connector-type") == "DP"
         and _cells_property(dtb, DCPEXT_PATH, "apple,dptx-phy") == [1]
-        and _cells_property(dtb, DCPEXT_PATH, "phys") == [atcphy1, PHY_TYPE_DP]
-        and _string_property(dtb, DCPEXT_PATH, "phy-names") == "dp-phy"
-        and _cells_property(dtb, DCPEXT_PATH, "mux-controls") == [xbar, 0]
-        and _string_property(dtb, DCPEXT_PATH, "mux-control-names") == "dp-xbar"
-        and _cells_property(dtb, DCPEXT_PATH, "mux-index") == [0]
-        and _string_property(dtb, ATCPHY1_XBAR_PATH, "compatible")
-        == "apple,t8103-display-crossbar"
-        and _cells_property(dtb, ATCPHY1_XBAR_PATH, "#mux-control-cells") == [1]
+        and not any(
+            _has_property(dtb, DCPEXT_PATH, name)
+            for name in LEGACY_FIXED_ROUTE_PROPERTIES
+        )
         and _cells_property(dtb, DCPEXT_PATH, "iommus") == [dcpext_dart, 0]
         and _cells_property(dtb, DCPEXT_PATH, "mboxes") == [dcpext_mbox]
+        and _has_property(dtb, ATC0_COMMON_PATH, "apple,always-on")
         and _has_property(dtb, ATC1_COMMON_PATH, "apple,always-on")
     )
 
@@ -171,10 +182,6 @@ def _overlay_dts(dtb: pathlib.Path) -> str:
     dcpext = _phandle(dtb, DCPEXT_PATH)
     disp0_dart = _phandle(dtb, DISP0_DART_PATH)
     dispext0_dart = _phandle(dtb, DISPEXT0_DART_PATH)
-    atcphy1 = _phandle(dtb, ATCPHY1_PATH)
-    atc1_power = _cells_property(dtb, ATCPHY1_PATH, "power-domains")
-    if not atc1_power:
-        raise DcpextDtbError(f"guest DTB is missing {ATCPHY1_PATH}.power-domains")
 
     return f"""/dts-v1/;
 /plugin/;
@@ -188,45 +195,39 @@ def _overlay_dts(dtb: pathlib.Path) -> str:
     }};
 
     fragment@1 {{
-        target-path = "{TYPEC1_PATH}";
+        target-path = "{TYPEC0_PATH}";
         __overlay__ {{
             displayport = <0x{dcpext:x}>;
         }};
     }};
 
     fragment@2 {{
+        target-path = "{TYPEC1_PATH}";
+        __overlay__ {{
+            displayport = <0x{dcpext:x}>;
+        }};
+    }};
+
+    fragment@3 {{
         target-path = "{DISPLAY_PATH}";
         __overlay__ {{
             iommus = <0x{disp0_dart:x} 0 0x{dispext0_dart:x} 0>;
         }};
     }};
 
-    fragment@3 {{
+    fragment@4 {{
         target-path = "{DISPEXT0_DART_PATH}";
         __overlay__ {{ status = "okay"; }};
     }};
 
-    fragment@4 {{
+    fragment@5 {{
         target-path = "{DCPEXT_DART_PATH}";
         __overlay__ {{ status = "okay"; }};
     }};
 
-    fragment@5 {{
+    fragment@6 {{
         target-path = "{DCPEXT_MBOX_PATH}";
         __overlay__ {{ status = "okay"; }};
-    }};
-
-    fragment@6 {{
-        target-path = "{SOC_PATH}";
-        __overlay__ {{
-            atcphy1_xbar: mux@50304c000 {{
-                compatible = "apple,t8103-display-crossbar";
-                reg = <0x5 0x0304c000 0x0 0x4000>;
-                #mux-control-cells = <1>;
-                power-domains = <0x{atc1_power[0]:x}>;
-                status = "okay";
-            }};
-        }};
     }};
 
     fragment@7 {{
@@ -235,15 +236,15 @@ def _overlay_dts(dtb: pathlib.Path) -> str:
             status = "okay";
             apple,connector-type = "DP";
             apple,dptx-phy = <1>;
-            phys = <0x{atcphy1:x} {PHY_TYPE_DP}>;
-            phy-names = "dp-phy";
-            mux-controls = <&atcphy1_xbar 0>;
-            mux-control-names = "dp-xbar";
-            mux-index = <0>;
         }};
     }};
 
     fragment@8 {{
+        target-path = "{ATC0_COMMON_PATH}";
+        __overlay__ {{ apple,always-on; }};
+    }};
+
+    fragment@9 {{
         target-path = "{ATC1_COMMON_PATH}";
         __overlay__ {{ apple,always-on; }};
     }};
@@ -283,6 +284,13 @@ def patch_dtb_file(
             ]
         )
         _run([_tool("fdtoverlay"), "-i", input_dtb, "-o", output_dtb, overlay_dtbo])
+
+        # Migrate payloads previously patched with the ATC1-only topology.
+        # Device-tree overlays cannot reliably delete base properties, so use
+        # fdtput after applying the additive overlay.
+        for name in LEGACY_FIXED_ROUTE_PROPERTIES:
+            if _has_property(output_dtb, DCPEXT_PATH, name):
+                _run([_tool("fdtput"), "-d", output_dtb, DCPEXT_PATH, name])
 
     if not dtb_has_dcpext(output_dtb):
         raise DcpextDtbError("patched J293 DTB failed DCPext topology validation")

@@ -218,6 +218,27 @@ class ChainloadFailureTests(unittest.TestCase):
 
         self.assertTrue(MODULE.chainload_failure_is_retryable(error))
 
+    def test_dcpext_runtime_patch_uses_selected_payload_machine(self):
+        patcher = types.ModuleType("apple_dcpext_dtb")
+        patcher.patch_payload_bytes = mock.MagicMock(
+            return_value=(b"patched", True)
+        )
+        args = SimpleNamespace(
+            dcpext_dtb_patch="require",
+            machine="j293",
+            m1n1=pathlib.Path("m1n1.bin"),
+        )
+
+        with mock.patch.dict(sys.modules, {"apple_dcpext_dtb": patcher}):
+            result = MODULE.patch_dcpext_guest_payload(args, b"payload")
+
+        self.assertEqual(result, b"patched")
+        patcher.patch_payload_bytes.assert_called_once_with(
+            b"payload",
+            machine="j293",
+            m1n1_bin=args.m1n1,
+        )
+
     def test_hv_mode_loads_selected_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             directory_path = pathlib.Path(directory)
@@ -262,14 +283,22 @@ class ChainloadFailureTests(unittest.TestCase):
                 mock.patch.object(MODULE, "open_proxy", return_value=(iface, proxy)),
                 mock.patch.object(
                     MODULE,
+                    "patch_dcpext_guest_payload",
+                    side_effect=lambda _args, data: data + b"-dcpext",
+                ),
+                mock.patch.object(
+                    MODULE,
                     "patch_avd_guest_payload",
-                    side_effect=lambda _args, _adt, data: data,
+                    side_effect=lambda _args, _adt, data: data + b"-avd",
                 ),
                 mock.patch.object(MODULE, "enable_avd_pmgr"),
             ):
                 MODULE.start_guest(args)
 
-            hv.load_raw.assert_called_once_with(b"payload", args.entry_point)
+            hv.load_raw.assert_called_once_with(
+                b"payload-dcpext-avd",
+                args.entry_point,
+            )
             iface.writemem.assert_called_once_with(args.image_addr, b"image", True)
             hv.start.assert_called_once_with()
 
@@ -287,6 +316,7 @@ class ChainloadFailureTests(unittest.TestCase):
                 image_addr=0x900000000,
                 proxy_device="/dev/cu.test-proxy",
                 connect_timeout=1.0,
+                dcpext_dtb_patch="off",
                 avd_dtb_patch="off",
                 avd_pmgr="off",
             )

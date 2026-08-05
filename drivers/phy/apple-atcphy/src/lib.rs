@@ -27,7 +27,7 @@ use scarlet::{
         },
         reset::ResetController,
     },
-    early_println,
+    early_println, println,
 };
 
 // =============================================================================
@@ -662,7 +662,7 @@ impl AppleAtcPhy {
             scarlet::time::udelay(100);
             remaining_us -= 100;
         }
-        early_println!("[apple-atcphy] timeout waiting for {} power domain", domain);
+        println!("[apple-atcphy] timeout waiting for {} power domain", domain);
         Err("apple-atcphy: core power domain timeout")
     }
 
@@ -680,7 +680,7 @@ impl AppleAtcPhy {
 
     fn pipehandler_lock(&self) -> Result<(), &'static str> {
         if self.ph_read32(PIPEHANDLER_LOCK_REQ) & PIPEHANDLER_LOCK_EN != 0 {
-            early_println!("[apple-atcphy] warning: pipehandler already locked");
+            println!("[apple-atcphy] warning: pipehandler already locked");
             return Ok(());
         }
 
@@ -695,7 +695,7 @@ impl AppleAtcPhy {
         }
 
         self.ph_clear32(PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
-        early_println!("[apple-atcphy] warning: pipehandler lock not acknowledged");
+        println!("[apple-atcphy] warning: pipehandler lock not acknowledged");
         Err("apple-atcphy: pipehandler lock not acknowledged")
     }
 
@@ -710,7 +710,7 @@ impl AppleAtcPhy {
             remaining = remaining.saturating_sub(10);
         }
 
-        early_println!("[apple-atcphy] warning: pipehandler unlock not acknowledged");
+        println!("[apple-atcphy] warning: pipehandler unlock not acknowledged");
         Err("apple-atcphy: pipehandler unlock not acknowledged")
     }
 
@@ -719,7 +719,7 @@ impl AppleAtcPhy {
             return Ok(());
         }
 
-        early_println!("[apple-atcphy] warning: pipehandler is locked; releasing it");
+        println!("[apple-atcphy] warning: pipehandler is locked; releasing it");
         self.pipehandler_unlock()
     }
 
@@ -770,12 +770,12 @@ impl AppleAtcPhy {
         match mode {
             PhyMode::UsbHost | PhyMode::UsbOtg => {
                 self.usb2phy_set32(USB2PHY_SIG, USB2PHY_SIG_HOST);
-                early_println!("[apple-atcphy] usb2 mode host");
+                println!("[apple-atcphy] usb2 mode host");
                 Ok(())
             }
             PhyMode::UsbDevice => {
                 self.usb2phy_clear32(USB2PHY_SIG, USB2PHY_SIG_HOST);
-                early_println!("[apple-atcphy] usb2 mode device");
+                println!("[apple-atcphy] usb2 mode device");
                 Ok(())
             }
             _ => Err(PhyError::InvalidMode),
@@ -922,7 +922,7 @@ impl AppleAtcPhy {
         // preceding tunables before DCP attempts its first AUX transaction.
         self.core_mask32(ACIOPHY_LANE_MODE, ACIOPHY_LANE_MODE_MASK, lane_mode);
         let lane_mode_after = self.core_read32(ACIOPHY_LANE_MODE);
-        early_println!(
+        println!(
             "[apple-atcphy] lane mode {:?} reversed={} reg={:#x}->{:#x} crossbar={:#x}",
             mode,
             self.swap_lanes,
@@ -1437,7 +1437,7 @@ impl AppleAtcPhy {
             DP_PMA_BYTECLK_RESET | DP_MAC_DIV20_CLK_SEL,
         );
         self.dp_link_rate = Some(link_rate);
-        early_println!(
+        println!(
             "[apple-atcphy] DP link rate configured: {} Mbps/lane",
             link_rate
         );
@@ -1454,10 +1454,9 @@ impl AppleAtcPhy {
             return Err("apple-atcphy: requested mode is not DisplayPort-capable");
         }
         if self.dp_mode == Some(mode) && self.swap_lanes == reverse {
-            early_println!(
+            println!(
                 "[apple-atcphy] reusing boot-time {:?} mode (reversed={})",
-                mode,
-                reverse
+                mode, reverse
             );
             return Ok(());
         }
@@ -1524,7 +1523,7 @@ impl AppleAtcPhy {
                 false,
                 ACIOPHY_STATUS_TIMEOUT_US,
             ) {
-                early_println!("[apple-atcphy] warning: lane 0 remained busy before BIST");
+                println!("[apple-atcphy] warning: lane 0 remained busy before BIST");
             }
 
             self.core_set32(
@@ -1560,7 +1559,7 @@ impl AppleAtcPhy {
                 true,
                 ACIOPHY_STATUS_TIMEOUT_US,
             ) {
-                early_println!("[apple-atcphy] warning: lane 0 did not become ready during BIST");
+                println!("[apple-atcphy] warning: lane 0 did not become ready during BIST");
             }
             if !self.poll_core_bit(
                 ACIOPHY_TOP_PHY_STAT,
@@ -1568,7 +1567,7 @@ impl AppleAtcPhy {
                 false,
                 ACIOPHY_STATUS_TIMEOUT_US,
             ) {
-                early_println!("[apple-atcphy] warning: lane 0 remained busy after BIST");
+                println!("[apple-atcphy] warning: lane 0 remained busy after BIST");
             }
 
             let nonselected = self.ph_read32(PIPEHANDLER_NONSELECTED_OVERRIDE);
@@ -1613,11 +1612,11 @@ impl AppleAtcPhy {
 
         if host {
             if self.pipehandler_unlock().is_err() {
-                early_println!("[apple-atcphy] warning: failed to unlock USB3 pipehandler");
+                println!("[apple-atcphy] warning: failed to unlock USB3 pipehandler");
             }
         }
         self.pipehandler_up = true;
-        early_println!("[apple-atcphy] USB3 pipehandler configured (host={})", host);
+        println!("[apple-atcphy] USB3 pipehandler configured (host={})", host);
         Ok(())
     }
 
@@ -1630,7 +1629,7 @@ impl AppleAtcPhy {
         self.ph_set32(PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
         self.ph_set32(PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
         if self.pipehandler_lock().is_err() {
-            early_println!("[apple-atcphy] warning: failed to lock dummy pipehandler");
+            println!("[apple-atcphy] warning: failed to lock dummy pipehandler");
         }
 
         self.ph_mask32(
@@ -1653,7 +1652,7 @@ impl AppleAtcPhy {
         scarlet::time::udelay(10);
 
         if self.pipehandler_unlock().is_err() {
-            early_println!("[apple-atcphy] warning: failed to unlock dummy pipehandler");
+            println!("[apple-atcphy] warning: failed to unlock dummy pipehandler");
         }
         self.ph_mask32(
             PIPEHANDLER_NONSELECTED_OVERRIDE,
@@ -1692,19 +1691,19 @@ impl AppleAtcPhy {
     }
 
     fn dwc3_reset_assert(&mut self) {
-        early_println!("[apple-atcphy] dwc3 reset assert");
+        println!("[apple-atcphy] dwc3 reset assert");
         self.dwc3_reset_assert_raw();
 
         if self.pipehandler_up {
             if self.configure_pipehandler_dummy().is_err() {
-                early_println!("[apple-atcphy] warning: failed to switch PIPE to dummy");
+                println!("[apple-atcphy] warning: failed to switch PIPE to dummy");
             }
         }
         self.usb2_power_off();
     }
 
     fn dwc3_reset_deassert(&mut self) {
-        early_println!("[apple-atcphy] dwc3 reset deassert");
+        println!("[apple-atcphy] dwc3 reset deassert");
         self.ph_clear32(PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
         self.ph_set32(PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
     }
@@ -1787,13 +1786,80 @@ impl AppleAtcPhy {
         }
     }
 
+    /// Print the software and hardware state relevant to DisplayPort AUX and
+    /// link negotiation. This is intentionally read-only so it can be called
+    /// from the DCP callback path without changing PHY sequencing.
+    pub fn log_displayport_state(&self, stage: &str) {
+        println!(
+            "[apple-atcphy] DP snapshot stage={} core={:#x} mode={:?} reversed={} pipe-up={} rate={:?} lanes={}",
+            stage,
+            self.core_paddr,
+            self.dp_mode,
+            self.swap_lanes,
+            self.pipehandler_up,
+            self.dp_link_rate,
+            self.active_dp_lanes
+        );
+        println!(
+            "[apple-atcphy] DP snapshot tunables common={}/{} axi2af={} usb={}/{} dp={}/{}",
+            self.common_a.len(),
+            self.common_b.len(),
+            self.axi2af_tunables.len(),
+            self.lane0_usb.len(),
+            self.lane1_usb.len(),
+            self.lane0_dp.len(),
+            self.lane1_dp.len()
+        );
+        println!(
+            "[apple-atcphy] DP snapshot core misc={:#x} power={:#x}/{:#x} cfg0={:#x} sleep={:#x} lane={:#x} crossbar={:#x}",
+            self.core_read32(ATCPHY_MISC),
+            self.core_read32(ATCPHY_POWER_CTRL),
+            self.core_read32(ATCPHY_POWER_STAT),
+            self.core_read32(ACIOPHY_CFG0),
+            self.core_read32(ACIOPHY_SLEEP_CTRL),
+            self.core_read32(ACIOPHY_LANE_MODE),
+            self.core_read32(ACIOPHY_CROSSBAR)
+        );
+        println!(
+            "[apple-atcphy] DP snapshot clocks dpctrl={:#x} cio3pll={:#x} pll-common={:#x} pclk-stat={:#x} common-stat={:#x}",
+            self.core_read32(ACIOPHY_DP_CTRL0),
+            self.core_read32(CIO3PLL_CLK_CTRL),
+            self.core_read32(ACIOPHY_PLL_COMMON_CTRL),
+            self.core_read32(ACIOPHY_DP_PCLK_STAT),
+            self.core_read32(ACIOPHY_CMN_SHM_STS_REG0)
+        );
+        if self.lpdptx_base.is_some() {
+            println!(
+                "[apple-atcphy] DP snapshot aux control={:#x} ctrl={:#x} ldo={:#x} margin={:#x} shm={:#x}/{:#x}",
+                self.lpdptx_read32(LPDPTX_AUX_CONTROL),
+                self.lpdptx_read32(LPDPTX_AUX_CTRL),
+                self.lpdptx_read32(LPDPTX_AUX_LDO_CTRL),
+                self.lpdptx_read32(LPDPTX_AUX_MARGIN),
+                self.lpdptx_read32(LPDPTX_AUX_SHM_CTRL0),
+                self.lpdptx_read32(LPDPTX_AUX_SHM_CTRL1)
+            );
+        } else {
+            println!("[apple-atcphy] DP snapshot aux unmapped");
+        }
+        println!(
+            "[apple-atcphy] DP snapshot pipe override={:#x}/{:#x} mux={:#x} lock={:#x}/{:#x} aon={:#x} nonselected={:#x}",
+            self.ph_read32(PIPEHANDLER_OVERRIDE),
+            self.ph_read32(PIPEHANDLER_OVERRIDE_VALUES),
+            self.ph_read32(PIPEHANDLER_MUX_CTRL),
+            self.ph_read32(PIPEHANDLER_LOCK_REQ),
+            self.ph_read32(PIPEHANDLER_LOCK_ACK),
+            self.ph_read32(PIPEHANDLER_AON_GEN),
+            self.ph_read32(PIPEHANDLER_NONSELECTED_OVERRIDE)
+        );
+    }
+
     /// Initialize the PHY in USB3 mode.
     ///
     /// # Returns
     ///
     /// `Ok(())` when the PHY is powered and configured for USB3 operation.
     pub fn init(&mut self) -> Result<(), &'static str> {
-        early_println!("[apple-atcphy] initializing...");
+        println!("[apple-atcphy] initializing...");
 
         self.dp_mode = None;
         self.dp_link_rate = None;
@@ -1837,7 +1903,7 @@ impl AppleAtcPhy {
 
         self.core_set32(ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
 
-        early_println!("[apple-atcphy] initialized (USB3 PHY)");
+        println!("[apple-atcphy] initialized (USB3 PHY)");
         Ok(())
     }
 
@@ -1855,7 +1921,7 @@ impl AppleAtcPhy {
             return Err("apple-atcphy: lpdptx/axi2af regions not mapped, cannot init DP");
         }
 
-        early_println!("[apple-atcphy] initializing in DP mode ({:?})...", mode);
+        println!("[apple-atcphy] initializing in DP mode ({:?})...", mode);
 
         self.dp_mode = Some(mode);
         self.dp_link_rate = None;
@@ -1872,7 +1938,7 @@ impl AppleAtcPhy {
         // the transition used by Asahi's ATC PHY driver.
         let pipehandler_was_up = self.pipehandler_up;
         if pipehandler_was_up {
-            early_println!(
+            println!(
                 "[apple-atcphy] quiescing USB3 pipehandler for {:?} transition",
                 mode
             );
@@ -1920,18 +1986,8 @@ impl AppleAtcPhy {
             self.configure_pipehandler_usb3(true)?;
         }
 
-        early_println!(
-            "[apple-atcphy] DP state power={:#x}/{:#x} lane={:#x} crossbar={:#x} dpctrl={:#x} pll={:#x} aux={:#x}/{:#x}",
-            self.core_read32(ATCPHY_POWER_CTRL),
-            self.core_read32(ATCPHY_POWER_STAT),
-            self.core_read32(ACIOPHY_LANE_MODE),
-            self.core_read32(ACIOPHY_CROSSBAR),
-            self.core_read32(ACIOPHY_DP_CTRL0),
-            self.core_read32(ACIOPHY_PLL_COMMON_CTRL),
-            self.lpdptx_read32(LPDPTX_AUX_CONTROL),
-            self.lpdptx_read32(LPDPTX_AUX_CTRL),
-        );
-        early_println!("[apple-atcphy] initialized ({:?} mode)", mode);
+        self.log_displayport_state("init-dp");
+        println!("[apple-atcphy] initialized ({:?} mode)", mode);
         Ok(())
     }
 
@@ -1939,12 +1995,12 @@ impl AppleAtcPhy {
         match orientation {
             PhyOrientation::None | PhyOrientation::Normal => {
                 self.swap_lanes = false;
-                early_println!("[apple-atcphy] orientation normal");
+                println!("[apple-atcphy] orientation normal");
                 Ok(())
             }
             PhyOrientation::Reverse => {
                 self.swap_lanes = true;
-                early_println!("[apple-atcphy] orientation reverse");
+                println!("[apple-atcphy] orientation reverse");
                 Ok(())
             }
         }
@@ -2097,7 +2153,7 @@ impl Phy for AppleAtcPhyLane {
             }
             PHY_TYPE_USB3 => {
                 if phy.configure_pipehandler_dummy().is_err() {
-                    early_println!("[apple-atcphy] warning: failed to switch PIPE to dummy");
+                    println!("[apple-atcphy] warning: failed to switch PIPE to dummy");
                 }
                 phy.pipehandler_up = false;
                 phy.core_power_off().map_err(|_| PhyError::PowerOffFailed)

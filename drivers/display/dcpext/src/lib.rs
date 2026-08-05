@@ -41,11 +41,12 @@ use scarlet_driver_apple_asc::get_apple_asc_by_phandle;
 use scarlet_driver_apple_atcphy::{AppleAtcPhy, AtcPhyMode, get_atcphy_by_core_paddr};
 use scarlet_driver_apple_cd321x::{
     Cd321xDisplayPortLaneMode, displayport_hpd_level, displayport_lane_mode,
-    displayport_pin_assignment, get_cd321x_displayport_status_by_address,
-    get_cd321x_status_by_address, has_displayport_connection,
+    displayport_pin_assignment, get_cd321x_diagnostic_snapshot_by_address,
+    get_cd321x_displayport_status_by_address, get_cd321x_status_by_address,
+    has_displayport_connection,
 };
 use scarlet_driver_apple_dart::{DartDomain, DartInstance, DartPageTable, get_dart_by_phandle};
-use scarlet_driver_apple_dpxbar::route_t8103_dpphy;
+use scarlet_driver_apple_dpxbar::{log_dpxbar_state, route_t8103_dpphy};
 use scarlet_driver_apple_epic::EpicEndpoint;
 use scarlet_driver_apple_rtkit::AppleRtkit;
 
@@ -55,10 +56,15 @@ const DCP_SYSTEM_EP: u8 = 0x20;
 const DCP_DPTX_PORT_EP: u8 = 0x2a;
 const DCP_IBOOT_EP: u8 = 0x23;
 const DCP_IBOOT_SUBTYPE: u16 = 0xc0;
+const DCP_SYSTEM_SET_PROPERTY_SUBTYPE: u16 = 0x43;
+const DCP_SYSLOG_PROPERTY: &[u8] = b"gAFKConfigLogMask";
+const DCP_SYSLOG_MASK: u64 = 0xffff;
 const DCP_SERVICE_TIMEOUT_US: u64 = 5_000_000;
 const DCP_LINK_TIMEOUT_US: u64 = 2_000_000;
-const DCP_STATUS_RETRIES: usize = 20;
+const DPTX_INITIAL_HPD_DELAY_US: u64 = 50_000;
+const DCP_STATUS_RETRIES: usize = 100;
 const DCP_STATUS_RETRY_US: u64 = 100_000;
+const DCP_POWER_SETTLE_US: u64 = 100_000;
 
 #[derive(Clone, Copy)]
 struct J293TypecRoute {
@@ -397,6 +403,30 @@ fn find_piodma_iommu(dcp_phandle: u32) -> Option<(u32, usize)> {
     None
 }
 
+fn find_display_iommu(dart_phandle: u32) -> Option<(u32, usize)> {
+    let fdt = scarlet::device::fdt::FdtManager::get_manager().get_fdt()?;
+    for node in fdt.all_nodes() {
+        let Some(compatible) = node.compatible() else {
+            continue;
+        };
+        if !compatible
+            .all()
+            .any(|value| value == "apple,display-subsystem")
+        {
+            continue;
+        }
+        let Some(iommus) = node.property("iommus") else {
+            continue;
+        };
+        for specifier in iommus.value.chunks_exact(8) {
+            if read_be_u32(specifier, 0) == Some(dart_phandle) {
+                return Some((dart_phandle, read_be_u32(specifier, 4)? as usize));
+            }
+        }
+    }
+    None
+}
+
 fn map_handoff_regions(
     table: &mut DartPageTable,
     device_phandle: u32,
@@ -525,13 +555,68 @@ impl RemoteprocDmaMapper for DcpDmaMapper {
 
 struct DptxCallbackState {
     phy: Arc<IrqSpinLock<AppleAtcPhy>>,
+    typec_address: u16,
     max_lanes: u32,
     link_rate: u32,
     active_lanes: u32,
     drive_settings: [u32; 2],
+    activate_snapshot_pending: bool,
 }
 
 static DPTX_CALLBACK_STATE: IrqSpinLock<Option<DptxCallbackState>> = IrqSpinLock::new(None);
+
+fn log_pending_activate_snapshot() {
+    let (phy, typec_address) = {
+        let mut state_guard = DPTX_CALLBACK_STATE.lock();
+        let Some(state) = state_guard.as_mut() else {
+            return;
+        };
+        if !state.activate_snapshot_pending {
+            return;
+        }
+        state.activate_snapshot_pending = false;
+        (Arc::clone(&state.phy), state.typec_address)
+    };
+    phy.lock().log_displayport_state("activate-acked");
+    log_dpxbar_state("activate-acked");
+    log_cd321x_diagnostic(typec_address, "activate-acked");
+}
+
+fn log_cd321x_diagnostic(address: u16, stage: &str) {
+    let Some(result) = get_cd321x_diagnostic_snapshot_by_address(address) else {
+        println!(
+            "[apple-dcpext] CD321x snapshot stage={} addr={:#x} unavailable",
+            stage, address
+        );
+        return;
+    };
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            println!(
+                "[apple-dcpext] CD321x snapshot stage={} addr={:#x} failed: {}",
+                stage, address, error
+            );
+            return;
+        }
+    };
+    let sid = snapshot.displayport_status;
+    println!(
+        "[apple-dcpext] CD321x snapshot stage={} addr={:#x} event1={:#018x} plug={} status-update={} power-update={} data-update={} status={:#010x} power={:#010x} data={:#010x} sid-rx={:#010x} sid-config={:#010x}",
+        stage,
+        address,
+        snapshot.interrupt_event1,
+        snapshot.interrupt_event1 & (1 << 1) != 0,
+        snapshot.interrupt_event1 & (1 << 8) != 0,
+        snapshot.interrupt_event1 & (1 << 9) != 0,
+        snapshot.interrupt_event1 & (1 << 10) != 0,
+        snapshot.status.raw_status,
+        snapshot.status.raw_power_status,
+        snapshot.status.raw_data_status,
+        sid.map(|status| status.status_rx).unwrap_or(0),
+        sid.map(|status| status.configure).unwrap_or(0),
+    );
+}
 
 fn dptx_service_call(
     _channel: u32,
@@ -555,8 +640,12 @@ fn dptx_service_call(
         .ok_or("apple-dcpext: DPTX callback arrived without PHY state")?;
 
     match command {
-        DPTX_APCALL_ACTIVATE
-        | DPTX_APCALL_WILL_CHANGE_LINK_CONFIG
+        DPTX_APCALL_ACTIVATE => {
+            // Defer the register dump until EPIC has queued the callback ACK.
+            // Serial output here would lengthen firmware's synchronous call.
+            state.activate_snapshot_pending = true;
+        }
+        DPTX_APCALL_WILL_CHANGE_LINK_CONFIG
         | DPTX_APCALL_SET_DOWN_SPREAD
         | DPTX_APCALL_SET_LANE_MAP
         | DPTX_APCALL_FORCE_HPD => {}
@@ -636,9 +725,16 @@ fn dptx_service_call(
         }
         DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD
         | DPTX_APCALL_GET_DOWN_SPREAD
-        | DPTX_APCALL_GET_SUPPORTS_LANE_MAPPING
-        | DPTX_APCALL_GET_SUPPORTS_HPD => {
+        | DPTX_APCALL_GET_SUPPORTS_LANE_MAPPING => {
             write_le_u32(reply, 16, 0);
+        }
+        DPTX_APCALL_GET_SUPPORTS_HPD => {
+            // The T8103/J293 Type-C implementation used with the 13.5 DPTX
+            // ABI advertises AP-driven HPD notifications.  Its matching
+            // connect path reports the already-asserted Type-C HPD after
+            // request-display returns; reporting no HPD support while also
+            // waiting for lanes before sending HPD creates a circular wait.
+            write_le_u32(reply, 16, 1);
         }
         DPTX_APCALL_SET_TILED_DISPLAY_HINTS => {
             write_le_u32(reply, 0, 1);
@@ -659,6 +755,21 @@ struct DcpIboot {
     firmware_13_3: bool,
 }
 
+struct DcpProgress<'a> {
+    system: &'a mut EpicEndpoint,
+    dptx: &'a mut EpicEndpoint,
+    iomfb: &'a mut Iomfb,
+}
+
+impl DcpProgress<'_> {
+    fn poll(&mut self) -> Result<(), &'static str> {
+        self.system.poll();
+        self.dptx.poll();
+        self.iomfb.poll_nonblocking()?;
+        Ok(())
+    }
+}
+
 impl DcpIboot {
     fn poll(&mut self) {
         self.endpoint.poll();
@@ -666,6 +777,7 @@ impl DcpIboot {
 
     fn call(
         &mut self,
+        progress: &mut DcpProgress<'_>,
         operation: u32,
         payload: &[u8],
         expects_output: bool,
@@ -677,9 +789,12 @@ impl DcpIboot {
         command[0..4].copy_from_slice(&operation.to_le_bytes());
         command[4..8].copy_from_slice(&(total as u32).to_le_bytes());
         command[16..].copy_from_slice(payload);
-        let reply = self
-            .endpoint
-            .call_raw_by_channel(self.channel, DCP_IBOOT_SUBTYPE, &command)?;
+        let reply = self.endpoint.call_raw_by_channel_with_progress(
+            self.channel,
+            DCP_IBOOT_SUBTYPE,
+            &command,
+            || progress.poll(),
+        )?;
         if reply.len() < 8 {
             return if expects_output {
                 Err("apple-dcpext: short iBoot reply")
@@ -698,13 +813,20 @@ impl DcpIboot {
         Ok(reply[8..reply_len.min(reply.len())].to_vec())
     }
 
-    fn set_power(&mut self, enabled: bool) -> Result<(), &'static str> {
-        self.call(IBOOT_SET_POWER, &[enabled as u8], false)?;
+    fn set_power(
+        &mut self,
+        progress: &mut DcpProgress<'_>,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        self.call(progress, IBOOT_SET_POWER, &[enabled as u8], false)?;
         Ok(())
     }
 
-    fn display_status(&mut self) -> Result<(bool, u32, u32), &'static str> {
-        let reply = self.call(IBOOT_GET_HPD, &[], true)?;
+    fn display_status(
+        &mut self,
+        progress: &mut DcpProgress<'_>,
+    ) -> Result<(bool, u32, u32), &'static str> {
+        let reply = self.call(progress, IBOOT_GET_HPD, &[], true)?;
         if reply.len() < 12 {
             return Err("apple-dcpext: short display status reply");
         }
@@ -715,8 +837,11 @@ impl DcpIboot {
         ))
     }
 
-    fn timing_modes(&mut self) -> Result<Vec<DcpTimingMode>, &'static str> {
-        let reply = self.call(IBOOT_GET_TIMING_MODES, &[], true)?;
+    fn timing_modes(
+        &mut self,
+        progress: &mut DcpProgress<'_>,
+    ) -> Result<Vec<DcpTimingMode>, &'static str> {
+        let reply = self.call(progress, IBOOT_GET_TIMING_MODES, &[], true)?;
         let count = read_wire::<u32>(&reply, 0).ok_or("apple-dcpext: missing timing count")?;
         let mut modes = Vec::new();
         for index in 0..count as usize {
@@ -728,8 +853,11 @@ impl DcpIboot {
         Ok(modes)
     }
 
-    fn color_modes(&mut self) -> Result<Vec<DcpColorMode>, &'static str> {
-        let reply = self.call(IBOOT_GET_COLOR_MODES, &[], true)?;
+    fn color_modes(
+        &mut self,
+        progress: &mut DcpProgress<'_>,
+    ) -> Result<Vec<DcpColorMode>, &'static str> {
+        let reply = self.call(progress, IBOOT_GET_COLOR_MODES, &[], true)?;
         let count = read_wire::<u32>(&reply, 0).ok_or("apple-dcpext: missing color count")?;
         let mut modes = Vec::new();
         for index in 0..count as usize {
@@ -743,6 +871,7 @@ impl DcpIboot {
 
     fn set_mode(
         &mut self,
+        progress: &mut DcpProgress<'_>,
         timing: &DcpTimingMode,
         color: &DcpColorMode,
     ) -> Result<(), &'static str> {
@@ -750,22 +879,27 @@ impl DcpIboot {
         let mut payload = alloc::vec![0u8; timing_len + mem::size_of::<DcpColorMode>()];
         payload[..timing_len].copy_from_slice(bytes_of(timing));
         payload[timing_len..].copy_from_slice(bytes_of(color));
-        self.call(IBOOT_SET_MODE, &payload, false)?;
+        self.call(progress, IBOOT_SET_MODE, &payload, false)?;
         Ok(())
     }
 
-    fn set_surface(&mut self, layer: &DcpLayer) -> Result<(), &'static str> {
-        self.call(IBOOT_SET_SURFACE, bytes_of(layer), false)?;
+    fn set_surface(
+        &mut self,
+        progress: &mut DcpProgress<'_>,
+        layer: &DcpLayer,
+    ) -> Result<(), &'static str> {
+        self.call(progress, IBOOT_SET_SURFACE, bytes_of(layer), false)?;
         Ok(())
     }
 
-    fn swap_begin(&mut self) -> Result<u32, &'static str> {
-        let reply = self.call(IBOOT_SWAP_BEGIN, &[], true)?;
+    fn swap_begin(&mut self, progress: &mut DcpProgress<'_>) -> Result<u32, &'static str> {
+        let reply = self.call(progress, IBOOT_SWAP_BEGIN, &[], true)?;
         read_le_u32(&reply, 12).ok_or("apple-dcpext: short swap-begin reply")
     }
 
     fn swap_set_layer(
         &mut self,
+        progress: &mut DcpProgress<'_>,
         layer_id: u32,
         layer: &DcpLayer,
         src: &DcpRect,
@@ -783,14 +917,30 @@ impl DcpIboot {
         payload
             [rect_offset + mem::size_of::<DcpRect>()..rect_offset + 2 * mem::size_of::<DcpRect>()]
             .copy_from_slice(bytes_of(dst));
-        self.call(IBOOT_SWAP_SET_LAYER, &payload, false)?;
+        self.call(progress, IBOOT_SWAP_SET_LAYER, &payload, false)?;
         Ok(())
     }
 
-    fn swap_end(&mut self) -> Result<(), &'static str> {
-        self.call(IBOOT_SWAP_END, &[0u8; 12], false)?;
+    fn swap_end(&mut self, progress: &mut DcpProgress<'_>) -> Result<(), &'static str> {
+        self.call(progress, IBOOT_SWAP_END, &[0u8; 12], false)?;
         Ok(())
     }
+}
+
+fn wait_with_dcp_progress(
+    iboot: &mut DcpIboot,
+    progress: &mut DcpProgress<'_>,
+    duration_us: u64,
+) -> Result<(), &'static str> {
+    let start = time::current_time();
+    while time::current_time().saturating_sub(start) < duration_us {
+        iboot.poll();
+        progress.poll()?;
+        for _ in 0..100 {
+            core::hint::spin_loop();
+        }
+    }
+    Ok(())
 }
 
 fn make_layer(config: &FramebufferConfig, dva: u64) -> DcpLayer {
@@ -910,7 +1060,15 @@ impl AppleDcpExt {
             .sync_page_tables()
             .map_err(|_| "apple-dcpext: display scanout DART sync failed")?;
         arch::io_wmb();
-        self.iboot.set_surface(&make_layer(config, dva[0]))?;
+        {
+            let mut progress = DcpProgress {
+                system: &mut self._system,
+                dptx: &mut self._dptx,
+                iomfb: &mut self.iomfb,
+            };
+            self.iboot
+                .set_surface(&mut progress, &make_layer(config, dva[0]))?;
+        }
         if !self.iomfb_powered {
             self.iomfb.power_on()?;
             self.iomfb_powered = true;
@@ -941,9 +1099,15 @@ impl AppleDcpExt {
             y: 0,
         };
         arch::io_wmb();
-        let _swap_id = self.iboot.swap_begin()?;
-        self.iboot.swap_set_layer(0, &layer, &rect, &rect)?;
-        self.iboot.swap_end()?;
+        let mut progress = DcpProgress {
+            system: &mut self._system,
+            dptx: &mut self._dptx,
+            iomfb: &mut self.iomfb,
+        };
+        let _swap_id = self.iboot.swap_begin(&mut progress)?;
+        self.iboot
+            .swap_set_layer(&mut progress, 0, &layer, &rect, &rect)?;
+        self.iboot.swap_end(&mut progress)?;
         Ok(())
     }
 }
@@ -1039,6 +1203,31 @@ fn wait_for_named_service(
             core::hint::spin_loop();
         }
     }
+}
+
+fn enable_dcp_syslog(endpoint: &mut EpicEndpoint, channel: u32) -> Result<(), &'static str> {
+    let aligned_name_len = DCP_SYSLOG_PROPERTY.len().div_ceil(4) * 4;
+    let value_offset = 4usize
+        .checked_add(aligned_name_len)
+        .ok_or("apple-dcpext: syslog property size overflow")?;
+    let total = value_offset
+        .checked_add(16)
+        .ok_or("apple-dcpext: syslog property size overflow")?;
+    let mut request = alloc::vec![0u8; total];
+    write_le_u32(&mut request, 0, aligned_name_len as u32);
+    request[4..4 + DCP_SYSLOG_PROPERTY.len()].copy_from_slice(DCP_SYSLOG_PROPERTY);
+
+    // OSSerializedInt: object marker, final integer tag (type=4, 64 bits), value.
+    write_le_u32(&mut request, value_offset, 0xd3);
+    write_le_u32(&mut request, value_offset + 4, 0x8400_0040);
+    write_le_u64(&mut request, value_offset + 8, DCP_SYSLOG_MASK);
+
+    let _ = endpoint.call_raw_by_channel(channel, DCP_SYSTEM_SET_PROPERTY_SUBTYPE, &request)?;
+    println!(
+        "[apple-dcpext] enabled DCP syslog mask={:#x}",
+        DCP_SYSLOG_MASK
+    );
+    Ok(())
 }
 
 fn dptx_connect(
@@ -1192,13 +1381,15 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     };
     let reverse = typec_status.orientation == TypecOrientation::Reverse;
     println!(
-        "[apple-dcpext] Type-C route addr={:#x} atc={} preferred-atc={} assignment={:?} mode={:?} reversed={} hpd=true sid-status-rx={:#010x} sid-configure={:#010x}",
+        "[apple-dcpext] Type-C route addr={:#x} atc={} preferred-atc={} assignment={:?} mode={:?} reversed={} hpd=true status={:#010x} data-status={:#010x} sid-status-rx={:#010x} sid-configure={:#010x}",
         typec_address,
         atc_index,
         preferred_atc_index,
         displayport_pin_assignment(&typec_status),
         mode,
         reverse,
+        typec_status.raw_status,
+        typec_status.raw_data_status,
         sid_status.status_rx,
         sid_status.configure,
     );
@@ -1207,6 +1398,8 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         phy.configure_displayport(mode, reverse)?;
         route_t8103_dpphy(phy.display_crossbar_paddr())?;
     }
+    log_dpxbar_state("routed");
+    log_cd321x_diagnostic(typec_address, "pre-connect");
 
     let dcp_phandle = device_phandle(device).ok_or("apple-dcpext: missing phandle")?;
     let (dart_phandle, dart_stream) =
@@ -1221,10 +1414,15 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         root,
         dcp_dart.page_shift(),
     )?));
-    let (display_dart_phandle, display_stream) =
+    let (piodma_dart_phandle, piodma_stream) =
         find_piodma_iommu(dcp_phandle).ok_or("apple-dcpext: PIODMA IOMMU missing")?;
+    let (display_dart_phandle, display_stream) = find_display_iommu(piodma_dart_phandle)
+        .ok_or("apple-dcpext: display-subsystem IOMMU missing")?;
     let Some(display_dart) = get_dart_by_phandle(display_dart_phandle) else {
         return probe_deferred("DCPext display DART is not ready");
+    };
+    let Some(piodma_dart) = get_dart_by_phandle(piodma_dart_phandle) else {
+        return probe_deferred("DCPext PIODMA DART is not ready");
     };
     if display_dart.page_shift() != dcp_dart.page_shift() {
         return Err("apple-dcpext: DCP and display DART page sizes differ");
@@ -1237,16 +1435,25 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         display_dart.page_shift(),
     )?));
     let piodma_stream_id =
-        u32::try_from(display_stream).map_err(|_| "apple-dcpext: PIODMA stream ID out of range")?;
+        u32::try_from(piodma_stream).map_err(|_| "apple-dcpext: PIODMA stream ID out of range")?;
     let piodma_domain = Arc::new(
         DartDomain::wrap_existing(
-            Arc::clone(&display_dart),
+            Arc::clone(&piodma_dart),
             IommuStreamId {
                 id: piodma_stream_id,
                 substream_id: None,
             },
         )
         .map_err(|_| "apple-dcpext: PIODMA firmware page table unavailable")?,
+    );
+    println!(
+        "[apple-dcpext] DART streams dcp={:#x}:{} display={:#x}:{} piodma={:#x}:{}",
+        dart_phandle,
+        dart_stream,
+        display_dart_phandle,
+        display_stream,
+        piodma_dart_phandle,
+        piodma_stream,
     );
     let handoff_maps = map_handoff_regions(&mut dcp_table.lock(), dcp_phandle)?;
     if handoff_maps == 0 {
@@ -1286,6 +1493,14 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     rtkit.start_ep(DCP_SYSTEM_EP)?;
     let mut system = EpicEndpoint::new(remoteproc.clone(), DCP_SYSTEM_EP)?;
     wait_for_named_service(&mut system, "system", DCP_SERVICE_TIMEOUT_US)?;
+    let system_channel = system
+        .find_service("system")
+        .map(|service| service.channel)
+        .ok_or("apple-dcpext: system service channel unavailable")?;
+    rtkit.set_syslog_printing(true);
+    if let Err(error) = enable_dcp_syslog(&mut system, system_channel) {
+        println!("[apple-dcpext] failed to enable DCP syslog: {}", error);
+    }
 
     // Both m1n1 and Asahi Linux bring up the iBoot display service before
     // asking the DPTX port service to request a display.  DCP firmware does
@@ -1337,12 +1552,22 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
     let max_lanes = atcphy.lock().max_dp_lane_count();
     *DPTX_CALLBACK_STATE.lock() = Some(DptxCallbackState {
         phy: Arc::clone(&atcphy),
+        typec_address,
         max_lanes,
         link_rate: 0,
         active_lanes: 0,
         drive_settings: [0; 2],
+        activate_snapshot_pending: false,
     });
     dptx_connect(&mut dptx, dptx_channel, atc_index)?;
+
+    // J293's known Type-C path waits 50 ms after request-display and then
+    // forwards the physical HPD level to DCP.  Link-rate callbacks follow
+    // that notification, so it must precede the active-lane wait below.
+    time::udelay(DPTX_INITIAL_HPD_DELAY_US);
+    dptx_set_hpd(&mut dptx, dptx_channel, true)?;
+    println!("[apple-dcpext] DPTX initial HPD asserted before link wait");
+    log_pending_activate_snapshot();
 
     let link_start = time::current_time();
     loop {
@@ -1356,43 +1581,105 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         }
         if time::current_time().saturating_sub(link_start) >= DCP_LINK_TIMEOUT_US {
             let state = DPTX_CALLBACK_STATE.lock();
-            let (link_rate, active_lanes) = state
+            let (link_rate, active_lanes, phy) = state
                 .as_ref()
-                .map(|state| (state.link_rate, state.active_lanes))
-                .unwrap_or((0, 0));
+                .map(|state| {
+                    (
+                        state.link_rate,
+                        state.active_lanes,
+                        Some(Arc::clone(&state.phy)),
+                    )
+                })
+                .unwrap_or((0, 0, None));
+            drop(state);
             println!(
                 "[apple-dcpext] DPTX link timeout: rate={:#x} lanes={}",
                 link_rate, active_lanes
             );
+            if let Some(phy) = phy {
+                phy.lock().log_displayport_state("link-timeout");
+            }
+            log_dpxbar_state("link-timeout");
+            log_cd321x_diagnostic(typec_address, "link-timeout");
             return Err("apple-dcpext: DPTX link negotiation did not select lanes");
         }
         system.poll();
         iboot.poll();
         dptx.poll();
+        iomfb.poll_nonblocking()?;
+        log_pending_activate_snapshot();
         for _ in 0..100 {
             core::hint::spin_loop();
         }
     }
-    dptx_set_hpd(&mut dptx, dptx_channel, true)?;
 
-    iboot.set_power(true)?;
-    let mut status = (false, 0, 0);
-    for _ in 0..DCP_STATUS_RETRIES {
-        status = iboot.display_status()?;
-        if status.0 && status.1 != 0 && status.2 != 0 {
-            break;
+    let link_config = DPTX_CALLBACK_STATE
+        .lock()
+        .as_ref()
+        .map(|state| (state.link_rate, state.active_lanes))
+        .unwrap_or((0, 0));
+    println!(
+        "[apple-dcpext] DPTX link configured rate={:#x} lanes={}",
+        link_config.0, link_config.1
+    );
+
+    // External DPTX publishes HPD and its mode counts before accepting the
+    // iBoot power-on request.  Keep every started DCP endpoint moving while
+    // that asynchronous publication and each synchronous iBoot call run.
+    let mut iomfb_powered = false;
+    let timing = {
+        let mut progress = DcpProgress {
+            system: &mut system,
+            dptx: &mut dptx,
+            iomfb: &mut iomfb,
+        };
+        let mut status = (false, 0, 0);
+        let mut previous_status = None;
+        for _ in 0..DCP_STATUS_RETRIES {
+            progress.poll()?;
+            status = iboot.display_status(&mut progress)?;
+            if previous_status != Some(status) {
+                println!(
+                    "[apple-dcpext] external status hpd={} timings={} colors={}",
+                    status.0, status.1, status.2
+                );
+                previous_status = Some(status);
+            }
+            if status.0 && status.1 != 0 && status.2 != 0 {
+                break;
+            }
+            wait_with_dcp_progress(&mut iboot, &mut progress, DCP_STATUS_RETRY_US)?;
         }
-        time::udelay(DCP_STATUS_RETRY_US);
-    }
-    if !status.0 {
-        return Err("apple-dcpext: external display did not assert HPD");
-    }
+        if !status.0 {
+            return Err("apple-dcpext: external display did not assert HPD");
+        }
+        if status.1 == 0 || status.2 == 0 {
+            return Err("apple-dcpext: external display did not publish mode counts");
+        }
 
-    let timing = choose_timing(&iboot.timing_modes()?)
-        .ok_or("apple-dcpext: no usable external timing at or below 60 Hz")?;
-    let color =
-        choose_color(&iboot.color_modes()?).ok_or("apple-dcpext: no usable external color mode")?;
-    iboot.set_mode(&timing, &color)?;
+        // A401 has already moved this DCP instance onto the runtime IOMFB
+        // pipeline.  Sending iBoot SET_POWER here asks firmware to start the
+        // mutually exclusive hardware-root-iBoot path and crashes T8103 in
+        // start_hardware_root_iboot().  Use the 13.5 runtime power sequence
+        // (A410/A441/A472) for the pipeline that we actually started.
+        drop(progress);
+        iomfb.power_on()?;
+        iomfb_powered = true;
+        println!("[apple-dcpext] external IOMFB display client powered on");
+        let mut progress = DcpProgress {
+            system: &mut system,
+            dptx: &mut dptx,
+            iomfb: &mut iomfb,
+        };
+        wait_with_dcp_progress(&mut iboot, &mut progress, DCP_POWER_SETTLE_US)?;
+
+        let timing = choose_timing(&iboot.timing_modes(&mut progress)?)
+            .ok_or("apple-dcpext: no usable external timing at or below 60 Hz")?;
+        let color = choose_color(&iboot.color_modes(&mut progress)?)
+            .ok_or("apple-dcpext: no usable external color mode")?;
+        iboot.set_mode(&mut progress, &timing, &color)?;
+        timing
+    };
     let selected_mode = MirrorMode {
         width: timing.width,
         height: timing.height,
@@ -1421,7 +1708,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         mode: selected_mode,
         iboot,
         iomfb,
-        iomfb_powered: false,
+        iomfb_powered,
         _system: system,
         _dptx: dptx,
         dcp_table,

@@ -224,6 +224,46 @@ impl Iomfb {
         Ok(message.msg)
     }
 
+    /// Process at most one pending IOMFB message without blocking.
+    ///
+    /// Some iBoot EPIC commands synchronously trigger an IOMFB callback before
+    /// their own reply is published.  DCP clients must therefore keep endpoint
+    /// 0x37 moving while they wait on another endpoint.
+    pub fn poll_nonblocking(&mut self) -> Result<bool, &'static str> {
+        let mut message = RtkitMessage { ep: 0, msg: 0 };
+        if !self.rtkit.recv_endpoint(ENDPOINT, &mut message)? {
+            return Ok(false);
+        }
+        if message.msg & MESSAGE_TYPE_MASK != MESSAGE_TYPE_RPC {
+            return Ok(true);
+        }
+
+        let (context, offset, length, ack) = Self::parse_rpc(message.msg);
+        if !ack {
+            let base = Self::channel_offset(context)?
+                .checked_add(offset)
+                .ok_or("apple-dcp: IOMFB callback offset overflow")?;
+            scarlet::arch::invalidate_dcache_to_poc_range(
+                self.shmem.as_ptr() as usize + base,
+                length,
+            );
+            let header = self.packet_header(base)?;
+            let tag = [header.tag[3], header.tag[2], header.tag[1], header.tag[0]];
+            self.handle_callback(context, offset, length)?;
+            println!(
+                "[apple-dcp] cooperative IOMFB callback ACK tag={}{}{}{} context={} offset={:#x} length={}",
+                tag[0] as char,
+                tag[1] as char,
+                tag[2] as char,
+                tag[3] as char,
+                context,
+                offset,
+                length
+            );
+        }
+        Ok(true)
+    }
+
     fn shared_slice(&self, offset: usize, length: usize) -> Result<&[u8], &'static str> {
         let end = offset
             .checked_add(length)

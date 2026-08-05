@@ -99,6 +99,11 @@ const MGMT_MSG_START_EP_FLAG: u64 = 1 << 1;
 const RTKIT_SYSLOG_TYPE: u64 = 0x0FF0_0000_0000_0000;
 const RTKIT_SYSLOG_LOG: u64 = 5;
 const RTKIT_SYSLOG_INIT: u64 = 8;
+const RTKIT_SYSLOG_INIT_ENTRY_SIZE: u64 = 0x0000_00FF_FF00_0000;
+const RTKIT_SYSLOG_INIT_COUNT: u64 = 0x0000_0000_0000_FFFF;
+const RTKIT_SYSLOG_LOG_INDEX: u64 = 0x0000_0000_0000_00FF;
+const RTKIT_SYSLOG_ENTRY_HEADER_SIZE: usize = 32;
+const RTKIT_SYSLOG_CONTEXT_SIZE: usize = 24;
 
 const RTKIT_OSLOG_TYPE: u64 = 0xFF00_0000_0000_0000;
 const RTKIT_OSLOG_INIT: u64 = 1;
@@ -149,6 +154,7 @@ pub struct AppleRtkit {
     crash_handler: Arc<IrqSpinLock<Option<Arc<dyn RemoteprocCrashHandler>>>>,
     dma_mapper: Option<Arc<dyn RemoteprocDmaMapper>>,
     syslog_buffers: Arc<IrqSpinLock<Vec<SyslogBuffer>>>,
+    syslog_state: Arc<IrqSpinLock<SyslogState>>,
     pending_messages: Arc<IrqSpinLock<VecDeque<RtkitMessage>>>,
 }
 
@@ -157,6 +163,13 @@ struct SyslogBuffer {
     paddr: usize,
     dva: u64,
     pages: usize,
+}
+
+#[derive(Default)]
+struct SyslogState {
+    count: usize,
+    entry_size: usize,
+    print_entries: bool,
 }
 
 impl AppleRtkit {
@@ -172,6 +185,7 @@ impl AppleRtkit {
             crash_handler: Arc::new(IrqSpinLock::new(None)),
             dma_mapper: None,
             syslog_buffers: Arc::new(IrqSpinLock::new(Vec::new())),
+            syslog_state: Arc::new(IrqSpinLock::new(SyslogState::default())),
             pending_messages: Arc::new(IrqSpinLock::new(VecDeque::new())),
         }
     }
@@ -211,6 +225,13 @@ impl AppleRtkit {
     /// `Ok(())` when RTKit reaches the powered-on state.
     pub fn wake(&self) -> Result<(), &'static str> {
         self.boot_inner(&[], false, false)
+    }
+
+    /// Enable or disable printing entries received through RTKit's syslog
+    /// endpoint. Buffer negotiation and acknowledgements remain active either
+    /// way; individual clients opt in to avoid flooding unrelated devices.
+    pub fn set_syslog_printing(&self, enabled: bool) {
+        self.syslog_state.lock().print_entries = enabled;
     }
 
     /// Perform the RTKit boot handshake and start required endpoints.
@@ -664,80 +685,157 @@ impl AppleRtkit {
     }
 
     fn dump_crashlog(&self) {
-        let buffers = self.syslog_buffers.lock();
-        let Some(buffer) = buffers.iter().find(|buffer| buffer.ep == RTKIT_EP_CRASHLOG) else {
-            return;
+        let (paddr, pages) = {
+            let buffers = self.syslog_buffers.lock();
+            let Some(buffer) = buffers.iter().find(|buffer| buffer.ep == RTKIT_EP_CRASHLOG) else {
+                return;
+            };
+            (buffer.paddr, buffer.pages)
         };
-        let size = buffer.pages.saturating_mul(scarlet::environment::PAGE_SIZE);
-        if buffer.paddr == 0 || size < 0x20 {
+        let size = pages.saturating_mul(scarlet::environment::PAGE_SIZE);
+        if paddr == 0 || size < 0x20 {
             println!("[apple-rtkit] coprocessor crashed; crashlog is not CPU-addressable");
             return;
         }
 
-        let vaddr = vm::phys_to_virt(buffer.paddr);
+        // Pre-allocated RTKit crashlogs live in firmware-owned reserved RAM,
+        // which is intentionally absent from Scarlet's sparse direct map.
+        // Map only this buffer as normal memory instead of assuming an HHDM
+        // alias with phys_to_virt().
+        let vaddr = match vm::memremap_normal(paddr, size) {
+            Ok(vaddr) => vaddr,
+            Err(error) => {
+                println!(
+                    "[apple-rtkit] coprocessor crashed; failed to map crashlog paddr={:#x} size={:#x}: {}",
+                    paddr, size, error
+                );
+                return;
+            }
+        };
         scarlet::arch::invalidate_dcache_to_poc_range(vaddr, size);
         // SAFETY: the DART translation identifies the firmware-owned crashlog mapping.
         let bytes = unsafe { core::slice::from_raw_parts(vaddr as *const u8, size) };
-        let read_u32 = |offset: usize| {
-            bytes
-                .get(offset..offset + 4)
-                .and_then(|value| value.try_into().ok())
-                .map(u32::from_le_bytes)
-        };
-        let Some(header) = read_u32(0) else {
-            return;
-        };
-        let total_size = read_u32(8).unwrap_or(0) as usize;
-        println!(
-            "[apple-rtkit] coprocessor crashed: crashlog={:#x} version={} size={:#x}",
-            header,
-            read_u32(4).unwrap_or(0),
-            total_size
-        );
-
-        let limit = core::cmp::min(total_size, size);
-        let mut offset = 0x20usize;
-        while offset + 16 <= limit {
-            let Some(section) = read_u32(offset) else {
-                break;
+        (|| {
+            let read_u32 = |offset: usize| {
+                bytes
+                    .get(offset..offset + 4)
+                    .and_then(|value| value.try_into().ok())
+                    .map(u32::from_le_bytes)
             };
-            let section_size = read_u32(offset + 12).unwrap_or(0) as usize;
-            if section_size < 16 || offset.saturating_add(section_size) > limit {
-                break;
-            }
-            if section == 0x4373_7472 && section_size >= 20 {
-                let payload = &bytes[offset + 20..offset + section_size];
-                let end = payload
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .unwrap_or(payload.len());
-                if let Ok(message) = core::str::from_utf8(&payload[..end]) {
-                    println!("[apple-rtkit] crash: {}", message);
+            let Some(header) = read_u32(0) else {
+                return;
+            };
+            let total_size = read_u32(8).unwrap_or(0) as usize;
+            println!(
+                "[apple-rtkit] coprocessor crashed: crashlog={:#x} version={} size={:#x}",
+                header,
+                read_u32(4).unwrap_or(0),
+                total_size
+            );
+
+            let limit = core::cmp::min(total_size, size);
+            let mut offset = 0x20usize;
+            while offset + 16 <= limit {
+                let Some(section) = read_u32(offset) else {
+                    break;
+                };
+                let section_size = read_u32(offset + 12).unwrap_or(0) as usize;
+                if section_size < 16 || offset.saturating_add(section_size) > limit {
+                    break;
                 }
-            } else if section == 0x4376_6572 && section_size >= 32 {
-                let payload = &bytes[offset + 32..offset + section_size];
-                let end = payload
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .unwrap_or(payload.len());
-                if let Ok(version) = core::str::from_utf8(&payload[..end]) {
-                    println!("[apple-rtkit] firmware: {}", version);
+                if section == 0x4373_7472 && section_size >= 20 {
+                    let payload = &bytes[offset + 20..offset + section_size];
+                    let end = payload
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(payload.len());
+                    if let Ok(message) = core::str::from_utf8(&payload[..end]) {
+                        println!("[apple-rtkit] crash: {}", message);
+                    }
+                } else if section == 0x4376_6572 && section_size >= 32 {
+                    let payload = &bytes[offset + 32..offset + section_size];
+                    let end = payload
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(payload.len());
+                    if let Ok(version) = core::str::from_utf8(&payload[..end]) {
+                        println!("[apple-rtkit] firmware: {}", version);
+                    }
                 }
+                offset += section_size;
             }
-            offset += section_size;
-        }
+        })();
+        vm::iounmap(vaddr);
     }
 
     fn handle_syslog_message(&self, msg: &RtkitMessage) -> Result<bool, &'static str> {
         match field_get(msg.msg, RTKIT_SYSLOG_TYPE) {
             MSG_BUFFER_REQUEST => self.handle_buffer_request(msg),
-            RTKIT_SYSLOG_INIT => Ok(true),
+            RTKIT_SYSLOG_INIT => {
+                let count = field_get(msg.msg, RTKIT_SYSLOG_INIT_COUNT) as usize;
+                let entry_size = field_get(msg.msg, RTKIT_SYSLOG_INIT_ENTRY_SIZE) as usize;
+                let mut state = self.syslog_state.lock();
+                state.count = count;
+                state.entry_size = entry_size;
+                println!(
+                    "[apple-rtkit] syslog initialized entries={} message-size={}",
+                    count, entry_size
+                );
+                Ok(true)
+            }
             RTKIT_SYSLOG_LOG => {
+                let index = field_get(msg.msg, RTKIT_SYSLOG_LOG_INDEX) as usize;
+                self.dump_syslog_entry(index);
                 self.send(msg)?;
                 Ok(true)
             }
             _ => Ok(false),
         }
+    }
+
+    fn dump_syslog_entry(&self, index: usize) {
+        let (count, entry_size, print_entries) = {
+            let state = self.syslog_state.lock();
+            (state.count, state.entry_size, state.print_entries)
+        };
+        if !print_entries || entry_size == 0 || index >= count {
+            return;
+        }
+
+        let (paddr, pages) = {
+            let buffers = self.syslog_buffers.lock();
+            let Some(buffer) = buffers.iter().find(|buffer| buffer.ep == RTKIT_EP_SYSLOG) else {
+                return;
+            };
+            (buffer.paddr, buffer.pages)
+        };
+        if paddr == 0 {
+            return;
+        }
+
+        let Some(stride) = RTKIT_SYSLOG_ENTRY_HEADER_SIZE.checked_add(entry_size) else {
+            return;
+        };
+        let Some(offset) = index.checked_mul(stride) else {
+            return;
+        };
+        let Some(end) = offset.checked_add(stride) else {
+            return;
+        };
+        let Some(buffer_size) = pages.checked_mul(scarlet::environment::PAGE_SIZE) else {
+            return;
+        };
+        if end > buffer_size {
+            return;
+        }
+
+        let vaddr = vm::phys_to_virt(paddr) + offset;
+        scarlet::arch::invalidate_dcache_to_poc_range(vaddr, stride);
+        // SAFETY: bounds above constrain the entry to the mapped syslog buffer.
+        let bytes = unsafe { core::slice::from_raw_parts(vaddr as *const u8, stride) };
+        let context = syslog_string(&bytes[8..8 + RTKIT_SYSLOG_CONTEXT_SIZE]);
+        let message = syslog_string(&bytes[RTKIT_SYSLOG_ENTRY_HEADER_SIZE..]);
+        println!("[apple-rtkit] syslog [{}] {}", context, message);
     }
 
     fn handle_ioreport_message(&self, msg: &RtkitMessage) -> Result<bool, &'static str> {
@@ -944,9 +1042,21 @@ impl AppleRtkit {
             crash_handler: self.crash_handler.clone(),
             dma_mapper: self.dma_mapper.clone(),
             syslog_buffers: self.syslog_buffers.clone(),
+            syslog_state: self.syslog_state.clone(),
             pending_messages: self.pending_messages.clone(),
         })
     }
+}
+
+fn syslog_string(bytes: &[u8]) -> &str {
+    let mut end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    while end > 0 && matches!(bytes[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
+    core::str::from_utf8(&bytes[..end]).unwrap_or("<non-UTF-8>")
 }
 
 /// Remoteproc service wrapper for one Apple RTKit endpoint.

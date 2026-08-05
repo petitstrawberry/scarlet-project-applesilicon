@@ -24,7 +24,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::mem;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use scarlet::device::graphics::output::{DisplayOutput, DisplayRegion};
 use scarlet::device::graphics::{FramebufferConfig, GraphicsDevice, PixelFormat};
@@ -632,19 +632,24 @@ pub struct AppleDcpGraphics {
     _dcp_table: Arc<IrqSpinLock<DartPageTable>>,
     _display_table: Arc<IrqSpinLock<DartPageTable>>,
     _piodma_domain: Arc<DartDomain>,
-    external_mirror: bool,
+    external_mirror: AtomicBool,
 }
 
 impl AppleDcpGraphics {
     fn present_external_mirror(&self, index: usize) {
-        if !self.external_mirror {
+        if !self.external_mirror.load(Ordering::Acquire) {
             return;
         }
         if let Err(error) = present_mirror_buffer(index) {
-            // Keep the internal panel alive if the boot-time external link is
-            // lost. Runtime connector recovery belongs to the future hotplug
-            // path and must not stall the compositor.
-            println!("[apple-dcp] external mirror present failed: {}", error);
+            // A dead external DCP must not put every later internal present
+            // through another synchronous EPIC timeout. Runtime connector
+            // recovery belongs to the future hotplug path.
+            if self.external_mirror.swap(false, Ordering::AcqRel) {
+                println!(
+                    "[apple-dcp] external mirror disabled after present failure: {}",
+                    error
+                );
+            }
         }
     }
 
@@ -751,7 +756,6 @@ impl GraphicsDevice for AppleDcpGraphics {
         }
 
         self.clean_scanout_regions(&self.scanout[back], &[])?;
-        self.present_external_mirror(back);
         let destination = state.destination;
         let swap_id = state.iomfb.swap_start()?;
         state.iomfb.swap_submit(
@@ -764,6 +768,10 @@ impl GraphicsDevice for AppleDcpGraphics {
         )?;
         state.iomfb.wait_swap_complete(swap_id)?;
         state.front = back;
+        // Commit the internal panel first. An external link failure can then
+        // delay this call once, but cannot leave the visible internal frame
+        // permanently behind the compositor's front-buffer state.
+        self.present_external_mirror(back);
         Ok(())
     }
 
@@ -810,7 +818,6 @@ impl GraphicsDevice for AppleDcpGraphics {
         }
 
         self.clean_scanout_regions(scanout, regions)?;
-        self.present_external_mirror(index);
         let destination = state.destination;
         let swap_id = state.iomfb.swap_start()?;
         state.iomfb.swap_submit(
@@ -823,6 +830,7 @@ impl GraphicsDevice for AppleDcpGraphics {
         )?;
         state.iomfb.wait_swap_complete(swap_id)?;
         state.front = index;
+        self.present_external_mirror(index);
         Ok(())
     }
 
@@ -1143,7 +1151,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         _dcp_table: dcp_table,
         _display_table: display_table,
         _piodma_domain: piodma_domain,
-        external_mirror,
+        external_mirror: AtomicBool::new(external_mirror),
     });
     let device_id = DeviceManager::get_manager()
         .register_device_with_name(alloc::string::String::from("apple-dcp"), graphics.clone());

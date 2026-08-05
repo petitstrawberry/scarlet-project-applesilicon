@@ -29,6 +29,7 @@ const TPS_REG_VID: u8 = 0x00;
 const TPS_REG_MODE: u8 = 0x03;
 const TPS_REG_CMD1: u8 = 0x08;
 const TPS_REG_DATA1: u8 = 0x09;
+const TPS_REG_INT_EVENT1: u8 = 0x14;
 const TPS_REG_STATUS: u8 = 0x1a;
 const TPS_REG_SYSTEM_POWER_STATE: u8 = 0x20;
 const TPS_REG_POWER_STATUS: u8 = 0x3f;
@@ -85,6 +86,14 @@ pub struct Cd321xDisplayPortStatus {
     pub status_rx: u32,
     pub configure: u32,
     pub mode_data: u32,
+}
+
+/// Read-only controller state used to diagnose Type-C/DisplayPort handoff.
+#[derive(Debug, Clone, Copy)]
+pub struct Cd321xDiagnosticSnapshot {
+    pub interrupt_event1: u64,
+    pub status: TypecPortStatus,
+    pub displayport_status: Option<Cd321xDisplayPortStatus>,
 }
 
 struct AppleCd321x {
@@ -501,6 +510,33 @@ pub fn get_cd321x_displayport_status_by_address(
             .map(|snapshot| snapshot.displayport_status)
             .map_err(|_| "apple-cd321x: failed to read DisplayPort SID status"),
     )
+}
+
+/// Read the latched interrupt event and current Type-C/DP state without
+/// acknowledging or clearing any CD321x interrupt bits.
+pub fn get_cd321x_diagnostic_snapshot_by_address(
+    address: u16,
+) -> Option<Result<Cd321xDiagnosticSnapshot, &'static str>> {
+    let controller = APPLE_CD321X
+        .lock()
+        .iter()
+        .find(|controller| controller.address.raw() == address)
+        .cloned()?;
+    Some((|| {
+        let interrupt_event1 = u64::from_le_bytes(
+            controller
+                .read_exact::<8>(TPS_REG_INT_EVENT1)
+                .map_err(|_| "apple-cd321x: failed to read INT_EVENT1")?,
+        );
+        let snapshot = controller
+            .snapshot()
+            .map_err(|_| "apple-cd321x: failed to read diagnostic state")?;
+        Ok(Cd321xDiagnosticSnapshot {
+            interrupt_event1,
+            status: AppleCd321x::status_from_snapshot(snapshot),
+            displayport_status: snapshot.displayport_status,
+        })
+    })())
 }
 
 scarlet::driver_initcall!(register_driver);

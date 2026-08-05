@@ -19,7 +19,7 @@ use scarlet::device::DeviceInfo;
 use scarlet::device::manager::{DeviceManager, DriverPriority};
 use scarlet::device::platform::resource::PlatformDeviceResourceType;
 use scarlet::device::platform::{PlatformDeviceDriver, PlatformDeviceInfo};
-use scarlet::early_println;
+use scarlet::println;
 use scarlet::time;
 use scarlet::vm;
 
@@ -72,6 +72,32 @@ pub struct AppleDpxbar {
     n_ufp: u32,
 }
 
+#[derive(Clone, Copy)]
+struct DpxbarSnapshot {
+    paddr: usize,
+    wr_dptx: u32,
+    wr_n: u32,
+    wr_unk: u32,
+    rd_pclk1: u32,
+    rd_n: u32,
+    rd_unk: u32,
+    out_pclk1: u32,
+    out_n: u32,
+    out_unk: u32,
+    dispext_en: u32,
+    mux_ctrl: u32,
+    atc_en: u32,
+    wr_dptx_stat: u32,
+    wr_n_stat: u32,
+    rd_pclk1_stat: u32,
+    rd_pclk2_stat: u32,
+    rd_n_stat: u32,
+    out_pclk1_stat: u32,
+    out_pclk2_stat: u32,
+    out_n_stat: u32,
+    tunable: u32,
+}
+
 impl AppleDpxbar {
     fn new(paddr: usize, base: usize, n_ufp: u32) -> Self {
         Self {
@@ -111,10 +137,9 @@ impl AppleDpxbar {
     pub fn disconnect_all(&mut self) {
         for port in [MUX_DPPHY, MUX_DPIN0, MUX_DPIN1] {
             if let Err(error) = self.set(port, -1) {
-                early_println!(
+                println!(
                     "[apple-dpxbar] disconnect_all failed on port {}: {}",
-                    port,
-                    error
+                    port, error
                 );
             }
         }
@@ -123,7 +148,7 @@ impl AppleDpxbar {
     }
 
     fn log_status(&self) {
-        early_println!(
+        println!(
             "[apple-dpxbar] stat wr_dptx={:#x} wr_n={:#x} rd_pclk1={:#x} rd_pclk2={:#x} rd_n={:#x} out_pclk1={:#x} out_pclk2={:#x} out_n={:#x}",
             read32(self.base, FIFO_WR_DPTX_CLK_EN_STAT),
             read32(self.base, FIFO_WR_N_CLK_EN_STAT),
@@ -134,6 +159,33 @@ impl AppleDpxbar {
             read32(self.base, OUT_PCLK2_EN_STAT),
             read32(self.base, OUT_N_CLK_EN_STAT)
         );
+    }
+
+    fn snapshot(&self) -> DpxbarSnapshot {
+        DpxbarSnapshot {
+            paddr: self.paddr,
+            wr_dptx: read32(self.base, FIFO_WR_DPTX_CLK_EN),
+            wr_n: read32(self.base, FIFO_WR_N_CLK_EN),
+            wr_unk: read32(self.base, FIFO_WR_UNK_EN),
+            rd_pclk1: read32(self.base, FIFO_RD_PCLK1_EN),
+            rd_n: read32(self.base, FIFO_RD_N_CLK_EN),
+            rd_unk: read32(self.base, FIFO_RD_UNK_EN),
+            out_pclk1: read32(self.base, OUT_PCLK1_EN),
+            out_n: read32(self.base, OUT_N_CLK_EN),
+            out_unk: read32(self.base, OUT_UNK_EN),
+            dispext_en: read32(self.base, CROSSBAR_DISPEXT_EN),
+            mux_ctrl: read32(self.base, CROSSBAR_MUX_CTRL),
+            atc_en: read32(self.base, CROSSBAR_ATC_EN),
+            wr_dptx_stat: read32(self.base, FIFO_WR_DPTX_CLK_EN_STAT),
+            wr_n_stat: read32(self.base, FIFO_WR_N_CLK_EN_STAT),
+            rd_pclk1_stat: read32(self.base, FIFO_RD_PCLK1_EN_STAT),
+            rd_pclk2_stat: read32(self.base, FIFO_RD_PCLK2_EN_STAT),
+            rd_n_stat: read32(self.base, FIFO_RD_N_CLK_EN_STAT),
+            out_pclk1_stat: read32(self.base, OUT_PCLK1_EN_STAT),
+            out_pclk2_stat: read32(self.base, OUT_PCLK2_EN_STAT),
+            out_n_stat: read32(self.base, OUT_N_CLK_EN_STAT),
+            tunable: read32(self.base, UNK_TUNABLE),
+        }
     }
 
     fn set(&mut self, port_index: usize, dispext_state: i32) -> Result<(), &'static str> {
@@ -281,20 +333,17 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         let tunable = read32(base, UNK_TUNABLE);
         write32(base, UNK_TUNABLE, 0);
         let tunable_after = read32(base, UNK_TUNABLE);
-        early_println!(
+        println!(
             "[apple-dpxbar] t8103 tunable: before={:#x} after={:#x}",
-            tunable,
-            tunable_after
+            tunable, tunable_after
         );
     }
 
     dpxbar.disconnect_all();
 
-    early_println!(
+    println!(
         "[apple-dpxbar] probe: paddr={:#x} size={:#x} n_ufp={}",
-        paddr,
-        size,
-        dpxbar.n_ufp
+        paddr, size, dpxbar.n_ufp
     );
 
     let mut registry = DPXBAR.lock();
@@ -320,6 +369,57 @@ pub fn with_dpxbar<R>(f: impl FnOnce(&mut AppleDpxbar) -> R) -> Option<R> {
     guard.first_mut().map(f)
 }
 
+/// Log a read-only snapshot of every mapped DisplayPort crossbar.
+///
+/// MMIO is sampled while the registry is locked, then formatted only after
+/// releasing the lock. This keeps the callback-adjacent diagnostic path from
+/// holding the crossbar lock across serial output.
+pub fn log_dpxbar_state(stage: &str) {
+    let snapshots: Vec<DpxbarSnapshot> = {
+        let registry = DPXBAR.lock();
+        registry.iter().map(AppleDpxbar::snapshot).collect()
+    };
+
+    for snapshot in snapshots {
+        println!(
+            "[apple-dpxbar] snapshot stage={} paddr={:#x} ctrl wr_dptx={:#x} wr_n={:#x} wr_unk={:#x} rd_pclk1={:#x} rd_n={:#x} rd_unk={:#x}",
+            stage,
+            snapshot.paddr,
+            snapshot.wr_dptx,
+            snapshot.wr_n,
+            snapshot.wr_unk,
+            snapshot.rd_pclk1,
+            snapshot.rd_n,
+            snapshot.rd_unk
+        );
+        println!(
+            "[apple-dpxbar] snapshot stage={} paddr={:#x} out pclk1={:#x} n={:#x} unk={:#x} dispext={:#x} mux={:#x} atc={:#x} tunable={:#x}",
+            stage,
+            snapshot.paddr,
+            snapshot.out_pclk1,
+            snapshot.out_n,
+            snapshot.out_unk,
+            snapshot.dispext_en,
+            snapshot.mux_ctrl,
+            snapshot.atc_en,
+            snapshot.tunable
+        );
+        println!(
+            "[apple-dpxbar] snapshot stage={} paddr={:#x} stat wr_dptx={:#x} wr_n={:#x} rd_pclk1={:#x} rd_pclk2={:#x} rd_n={:#x} out_pclk1={:#x} out_pclk2={:#x} out_n={:#x}",
+            stage,
+            snapshot.paddr,
+            snapshot.wr_dptx_stat,
+            snapshot.wr_n_stat,
+            snapshot.rd_pclk1_stat,
+            snapshot.rd_pclk2_stat,
+            snapshot.rd_n_stat,
+            snapshot.out_pclk1_stat,
+            snapshot.out_pclk2_stat,
+            snapshot.out_n_stat
+        );
+    }
+}
+
 /// Lazily map a t8103 ATC display crossbar and route its DPPHY input to
 /// external-display state 0.
 ///
@@ -337,10 +437,9 @@ pub fn route_t8103_dpphy(crossbar_paddr: usize) -> Result<(), &'static str> {
         let before = read32(base, UNK_TUNABLE);
         write32(base, UNK_TUNABLE, 0);
         crossbar.disconnect_all();
-        early_println!(
+        println!(
             "[apple-dpxbar] lazily mapped t8103 crossbar paddr={:#x}, tunable={:#x}->0",
-            crossbar_paddr,
-            before
+            crossbar_paddr, before
         );
         registry.push(crossbar);
     }
@@ -350,7 +449,7 @@ pub fn route_t8103_dpphy(crossbar_paddr: usize) -> Result<(), &'static str> {
         .find(|entry| entry.paddr == crossbar_paddr)
         .ok_or("apple-dpxbar: crossbar registry failure")?;
     crossbar.set_port(DpxbarPort::DpPhy, Some(0))?;
-    early_println!(
+    println!(
         "[apple-dpxbar] routed dpphy to dispext0 at paddr={:#x}",
         crossbar_paddr
     );

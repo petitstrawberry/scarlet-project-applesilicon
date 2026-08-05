@@ -17,8 +17,8 @@ use alloc::vec::Vec;
 use core::mem;
 
 use scarlet::device::remoteproc::RemoteProcessor;
-use scarlet::early_println;
 use scarlet::mem::pmm;
+use scarlet::println;
 use scarlet::sync::IrqSpinLock;
 use scarlet::time;
 use scarlet::vm;
@@ -306,11 +306,9 @@ impl EpicEndpoint {
         let remoteproc = afk.lock().remoteproc();
         let dma = EpicDmaBuffer::alloc(remoteproc)?;
 
-        early_println!(
+        println!(
             "[apple-epic] DMA buffers: TX={:#x} RX={:#x} ({} bytes each)",
-            dma.tx_dva,
-            dma.rx_dva,
-            EPIC_BUFFER_SIZE
+            dma.tx_dva, dma.rx_dva, EPIC_BUFFER_SIZE
         );
 
         Ok(Self {
@@ -378,10 +376,9 @@ impl EpicEndpoint {
                         }
                     }
                     _ => {
-                        early_println!(
+                        println!(
                             "[apple-epic] unhandled msg type={} ch={}",
-                            msg_type,
-                            channel
+                            msg_type, channel
                         );
                     }
                 },
@@ -407,7 +404,7 @@ impl EpicEndpoint {
             }
 
             if time::current_time().saturating_sub(start) >= timeout_us {
-                early_println!(
+                println!(
                     "[apple-epic] timeout: found {} services, wanted {}",
                     self.services.len(),
                     min_services
@@ -551,6 +548,28 @@ impl EpicEndpoint {
         self.wait_reply(channel, subtype)
     }
 
+    /// Send a raw EPIC command while cooperatively progressing another DCP
+    /// endpoint during the synchronous reply wait.
+    ///
+    /// DCP commands can issue nested callbacks on a different RTKit endpoint
+    /// before completing their EPIC reply.  The regular call path remains
+    /// suitable for independent endpoints; users that share one DCP instance
+    /// can provide a non-blocking dispatcher here to avoid a cross-endpoint
+    /// wait cycle.
+    pub fn call_raw_by_channel_with_progress<F>(
+        &mut self,
+        channel: u32,
+        subtype: u16,
+        data: &[u8],
+        mut progress: F,
+    ) -> Result<Vec<u8>, &'static str>
+    where
+        F: FnMut() -> Result<(), &'static str>,
+    {
+        self.send_raw_command(channel, subtype, data)?;
+        self.wait_reply_with_progress(channel, subtype, &mut progress)
+    }
+
     /// Send a standard service call without waiting for a reply.
     pub fn send_command(
         &mut self,
@@ -681,12 +700,29 @@ impl EpicEndpoint {
 
     /// Wait for a reply on the specified channel.
     fn wait_reply(&mut self, channel: u32, expected_subtype: u16) -> Result<Vec<u8>, &'static str> {
+        let mut no_progress = || Ok(());
+        self.wait_reply_with_progress(channel, expected_subtype, &mut no_progress)
+    }
+
+    fn wait_reply_with_progress<F>(
+        &mut self,
+        channel: u32,
+        expected_subtype: u16,
+        progress: &mut F,
+    ) -> Result<Vec<u8>, &'static str>
+    where
+        F: FnMut() -> Result<(), &'static str> + ?Sized,
+    {
         let start = time::current_time();
 
         loop {
             if time::current_time().saturating_sub(start) >= EPIC_REPLY_TIMEOUT_US {
                 return Err("apple-epic: timeout waiting for command reply");
             }
+
+            // No AFK lock is held here.  A nested endpoint dispatcher may
+            // itself receive RTKit messages and issue callback replies.
+            progress()?;
 
             // Match Asahi Linux's AFK command loop: consume the RTKit
             // notification before inspecting the DMA ring. Besides providing
@@ -720,11 +756,9 @@ impl EpicEndpoint {
                         {
                             self.handle_notify(ch, &payload);
                         } else if ch == channel {
-                            early_println!(
+                            println!(
                                 "[apple-epic] unexpected type={} on ch={} while waiting for subtype={:#x}",
-                                msg_type,
-                                channel,
-                                expected_subtype
+                                msg_type, channel, expected_subtype
                             );
                         }
                     }
@@ -842,16 +876,34 @@ impl EpicEndpoint {
             }
             (CAT_NOTIFY, SUBTYPE_STD_SERVICE) => {
                 if let Err(error) = self.handle_service_call(channel, &sub, payload) {
-                    early_println!(
+                    println!(
                         "[apple-epic] standard service callback failed on ch={}: {}",
-                        channel,
-                        error
+                        channel, error
                     );
                 }
             }
             _ => {
+                let data_start = mem::size_of::<EpicHdr>() + mem::size_of::<EpicSubHdr>();
+                let data = payload.get(data_start..).unwrap_or(&[]);
+                let preview_len = data.len().min(16);
+                let endpoint = self.afk.lock().endpoint();
+                let category = sub.category;
+                let msg_type = sub.msg_type;
+                let seq = sub.seq;
+                let length = sub.length;
+                let inline_len = sub.inline_len;
+                println!(
+                    "[apple-epic] unhandled notify ep={} ch={} category={:#x} subtype={:#x} seq={} length={} inline={} data={:02x?}",
+                    endpoint,
+                    channel,
+                    category,
+                    msg_type,
+                    seq,
+                    length,
+                    inline_len,
+                    &data[..preview_len]
+                );
                 if let Some(handler) = self.notify_handler {
-                    let data_start = mem::size_of::<EpicHdr>() + mem::size_of::<EpicSubHdr>();
                     if payload.len() > data_start {
                         handler(channel, sub.msg_type, &payload[data_start..]);
                     }
@@ -874,7 +926,8 @@ impl EpicEndpoint {
             .len()
             .checked_sub(data_start)
             .ok_or("apple-epic: truncated inline service call")?;
-        let payload_size = (sub.length as usize).min(available);
+        let declared_size = sub.length as usize;
+        let payload_size = declared_size.min(available);
         if payload_size < mem::size_of::<EpicServiceApCall>() {
             return Err("apple-epic: inline service call header is truncated");
         }
@@ -930,7 +983,23 @@ impl EpicEndpoint {
         };
         reply[headers_size..].copy_from_slice(&reply_payload);
 
-        self.afk.lock().send(channel, TYPE_NOTIFY_ACK, &reply)
+        let command = call.command;
+        let request_seq = sub.seq;
+        let result = self.afk.lock().send(channel, TYPE_NOTIFY_ACK, &reply);
+        if result.is_ok() {
+            println!(
+                "[apple-epic] callback ACK queued ch={} command={} rx-seq={} tx-seq={} declared={} available={} data={} reply={}",
+                channel,
+                command,
+                request_seq,
+                header_seq,
+                declared_size,
+                available,
+                call_size,
+                reply.len()
+            );
+        }
+        result
     }
 
     fn handle_announce(&mut self, channel: u32, payload: &[u8]) {
@@ -956,7 +1025,7 @@ impl EpicEndpoint {
             return;
         }
 
-        early_println!("[apple-epic] service '{}' on channel {}", name, channel);
+        println!("[apple-epic] service '{}' on channel {}", name, channel);
 
         self.services.push(EpicService {
             name,
@@ -999,7 +1068,7 @@ impl EpicEndpoint {
 
         if cmd.retcode != 0 {
             let retcode = cmd.retcode;
-            early_println!("[apple-epic: command failed with retcode={:#x}", retcode);
+            println!("[apple-epic: command failed with retcode={:#x}", retcode);
             return Err("apple-epic: command returned non-zero retcode");
         }
 

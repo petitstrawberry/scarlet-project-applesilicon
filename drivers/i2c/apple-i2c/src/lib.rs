@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use scarlet::println;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::arch::mmio;
 use scarlet::device::clk::ClkHandle;
@@ -69,8 +69,8 @@ pub struct AppleI2cController {
     base: usize,
     bus_number: u32,
     _bus_clk: Option<ClkHandle>,
-    inner: Mutex<AppleI2cInner>,
-    transfer_lock: Mutex<()>,
+    inner: IrqSpinLock<AppleI2cInner>,
+    transfer_lock: IrqSpinLock<()>,
 }
 
 impl AppleI2cController {
@@ -80,11 +80,11 @@ impl AppleI2cController {
             base,
             bus_number,
             _bus_clk: bus_clk,
-            inner: Mutex::new(AppleI2cInner {
+            inner: IrqSpinLock::new(AppleI2cInner {
                 bus_hz: DEFAULT_BUS_HZ,
                 hw_rev: 0,
             }),
-            transfer_lock: Mutex::new(()),
+            transfer_lock: IrqSpinLock::new(()),
         };
         controller.init_hardware()?;
         Ok(controller)

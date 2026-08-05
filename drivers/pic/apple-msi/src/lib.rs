@@ -10,7 +10,7 @@ use scarlet::device::manager::DeviceManager;
 use scarlet::interrupt::msi::{
     MsiAllocation, MsiController, MsiError, MsiMessage, MsiRequest, MsiRequestFlags, MsiVector,
 };
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 // =============================================================================
 // MSI Configuration
@@ -31,7 +31,7 @@ pub struct MsiPortConfig {
     port_base: usize,
     base_vector: u32,
     num_vectors: u32,
-    allocated: Mutex<alloc::vec::Vec<bool>>,
+    allocated: IrqSpinLock<alloc::vec::Vec<bool>>,
 }
 
 impl MsiPortConfig {
@@ -52,7 +52,7 @@ impl MsiPortConfig {
             port_base,
             base_vector,
             num_vectors,
-            allocated: Mutex::new(alloc::vec![false; n]),
+            allocated: IrqSpinLock::new(alloc::vec![false; n]),
         }
     }
 
@@ -239,7 +239,7 @@ const PORT_MSICFG_ENABLE: u32 = 1 << 0;
 // Global MSI Registry
 // =============================================================================
 
-static MSI_PORTS: Mutex<alloc::vec::Vec<Arc<MsiPortConfig>>> = Mutex::new(alloc::vec::Vec::new());
+static MSI_PORTS: IrqSpinLock<alloc::vec::Vec<Arc<MsiPortConfig>>> = IrqSpinLock::new(alloc::vec::Vec::new());
 
 /// Register a low-level Apple MSI port configuration.
 ///

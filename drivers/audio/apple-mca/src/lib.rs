@@ -14,7 +14,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::{
     arch::mmio,
@@ -97,8 +97,8 @@ const DMA_ADAPTER_RX_NCHANS_SHIFT: u32 = 13;
 const DMA_ADAPTER_NCHANS_SHIFT: u32 = 20;
 const DMA_ADAPTER_FIXED_NCHANS: u32 = 0x2;
 
-static APPLE_MCA_DEVICES: Mutex<Vec<AppleMcaRegisteredDevice>> = Mutex::new(Vec::new());
-static APPLE_MCA_OUTPUTS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+static APPLE_MCA_DEVICES: IrqSpinLock<Vec<AppleMcaRegisteredDevice>> = IrqSpinLock::new(Vec::new());
+static APPLE_MCA_OUTPUTS: IrqSpinLock<Vec<(u32, usize)>> = IrqSpinLock::new(Vec::new());
 
 struct AppleMcaRegisteredDevice {
     phandle: u32,
@@ -198,11 +198,11 @@ struct AppleMca {
     clocks: Vec<ClkHandle>,
     cluster_power_domains: Vec<Option<Arc<dyn PowerDomain>>>,
     dmas: Vec<AppleMcaDma>,
-    stream: Mutex<Option<AppleMcaStream>>,
-    completion_callback: Mutex<Option<AudioCompletionCallback>>,
-    playback_codecs: Mutex<Vec<Arc<dyn AudioCodec>>>,
-    playback_codec_routes: Mutex<Vec<AppleMcaPlaybackCodec>>,
-    playback_ports: Mutex<Vec<usize>>,
+    stream: IrqSpinLock<Option<AppleMcaStream>>,
+    completion_callback: IrqSpinLock<Option<AudioCompletionCallback>>,
+    playback_codecs: IrqSpinLock<Vec<Arc<dyn AudioCodec>>>,
+    playback_codec_routes: IrqSpinLock<Vec<AppleMcaPlaybackCodec>>,
+    playback_ports: IrqSpinLock<Vec<usize>>,
 }
 
 struct AppleMcaOutput {
@@ -210,8 +210,8 @@ struct AppleMcaOutput {
     fe_cluster: usize,
     ports: Vec<usize>,
     codec_routes: Vec<AppleMcaPlaybackCodec>,
-    stream: Mutex<Option<AppleMcaStream>>,
-    completion_callback: Mutex<Option<AudioCompletionCallback>>,
+    stream: IrqSpinLock<Option<AppleMcaStream>>,
+    completion_callback: IrqSpinLock<Option<AudioCompletionCallback>>,
 }
 
 impl AppleMca {
@@ -232,11 +232,11 @@ impl AppleMca {
             clocks,
             cluster_power_domains,
             dmas,
-            stream: Mutex::new(None),
-            completion_callback: Mutex::new(None),
-            playback_codecs: Mutex::new(Vec::new()),
-            playback_codec_routes: Mutex::new(Vec::new()),
-            playback_ports: Mutex::new(Vec::new()),
+            stream: IrqSpinLock::new(None),
+            completion_callback: IrqSpinLock::new(None),
+            playback_codecs: IrqSpinLock::new(Vec::new()),
+            playback_codec_routes: IrqSpinLock::new(Vec::new()),
+            playback_ports: IrqSpinLock::new(Vec::new()),
         }
     }
 
@@ -1042,8 +1042,8 @@ impl AppleMcaOutput {
             fe_cluster,
             ports,
             codec_routes,
-            stream: Mutex::new(None),
-            completion_callback: Mutex::new(None),
+            stream: IrqSpinLock::new(None),
+            completion_callback: IrqSpinLock::new(None),
         }
     }
 

@@ -25,7 +25,7 @@ use scarlet::{
         ControlOps, MemoryMappingInfo, MemoryMappingOps,
         selectable::{ReadyInterest, ReadySet, SelectWaitOutcome, Selectable},
     },
-    sync::Mutex,
+    sync::IrqSpinLock,
 };
 
 use crate::{AVD_DMA_GRANULE, AVD_MAPPED_INPUT_BYTES, AVD_MAPPED_OUTPUT_BYTES, get_apple_avd};
@@ -111,30 +111,30 @@ pub(crate) fn register_avd_debug_device(avd_id: u32, backend: Arc<dyn VideoDecod
 
 struct AppleAvdDebugDevice {
     avd_id: u32,
-    avd: Arc<Mutex<crate::AppleAvd>>,
+    avd: Arc<IrqSpinLock<crate::AppleAvd>>,
     backend: Arc<dyn VideoDecodeBackend>,
-    last_report: Mutex<String>,
-    decode_buffer: Mutex<Option<ContiguousPages>>,
-    decode_stream: Mutex<Option<u32>>,
-    decode_pending: Mutex<bool>,
+    last_report: IrqSpinLock<String>,
+    decode_buffer: IrqSpinLock<Option<ContiguousPages>>,
+    decode_stream: IrqSpinLock<Option<u32>>,
+    decode_pending: IrqSpinLock<bool>,
 }
 
 impl AppleAvdDebugDevice {
     fn new(
         avd_id: u32,
-        avd: Arc<Mutex<crate::AppleAvd>>,
+        avd: Arc<IrqSpinLock<crate::AppleAvd>>,
         backend: Arc<dyn VideoDecodeBackend>,
     ) -> Self {
         Self {
             avd_id,
             avd,
             backend,
-            last_report: Mutex::new(String::from(
+            last_report: IrqSpinLock::new(String::from(
                 "write one of: info, fw-ping, dart-test, decode-one, poll-decode, trace, clear-trace\n",
             )),
-            decode_buffer: Mutex::new(None),
-            decode_stream: Mutex::new(None),
-            decode_pending: Mutex::new(false),
+            decode_buffer: IrqSpinLock::new(None),
+            decode_stream: IrqSpinLock::new(None),
+            decode_pending: IrqSpinLock::new(false),
         }
     }
 

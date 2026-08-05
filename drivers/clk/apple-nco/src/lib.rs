@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::{
     arch::mmio,
@@ -56,7 +56,7 @@ struct AppleNcoClock {
     index: u32,
     base: usize,
     parent: Option<ClkHandle>,
-    lock: Mutex<()>,
+    lock: IrqSpinLock<()>,
 }
 
 impl AppleNcoClock {
@@ -65,7 +65,7 @@ impl AppleNcoClock {
             index,
             base,
             parent,
-            lock: Mutex::new(()),
+            lock: IrqSpinLock::new(()),
         }
     }
 

@@ -13,7 +13,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::arch::mmio;
 use scarlet::device::manager::{DeviceManager, DriverPriority};
@@ -128,7 +128,7 @@ impl NvmemProvider for AppleEfuse {
     }
 }
 
-static EFUSE_REGISTRY: Mutex<Vec<Arc<AppleEfuse>>> = Mutex::new(Vec::new());
+static EFUSE_REGISTRY: IrqSpinLock<Vec<Arc<AppleEfuse>>> = IrqSpinLock::new(Vec::new());
 
 /// Return a probed Apple eFuse provider by registration index.
 ///

@@ -68,9 +68,11 @@ use scarlet::{
     },
     mem::page::ContiguousPages,
     println,
-    sync::{IrqGuard, Mutex},
+    sync::{IrqGuard, IrqSpinLock},
     time,
-    timer::{TimerHandler, add_timer, cancel_timer, get_tick, ms_to_ticks},
+    timer::{
+        TimerHandle, TimerHandler, TimerPrecision, add_timer, cancel_timer, get_time_ns, ms_to_ns,
+    },
     vm,
 };
 use scarlet_driver_apple_pmgr::{
@@ -1310,12 +1312,12 @@ impl AppleAvd {
     }
 }
 
-static AVD_REGISTRY: Mutex<Vec<Arc<Mutex<AppleAvd>>>> = Mutex::new(Vec::new());
+static AVD_REGISTRY: IrqSpinLock<Vec<Arc<IrqSpinLock<AppleAvd>>>> = IrqSpinLock::new(Vec::new());
 
 fn register_avd(avd: AppleAvd) -> u32 {
     let mut registry = AVD_REGISTRY.lock();
     let id = registry.len() as u32;
-    registry.push(Arc::new(Mutex::new(avd)));
+    registry.push(Arc::new(IrqSpinLock::new(avd)));
     id
 }
 
@@ -1328,7 +1330,7 @@ fn register_avd(avd: AppleAvd) -> u32 {
 /// # Returns
 ///
 /// Reference-counted AVD instance when present.
-pub fn get_apple_avd(id: u32) -> Option<Arc<Mutex<AppleAvd>>> {
+pub fn get_apple_avd(id: u32) -> Option<Arc<IrqSpinLock<AppleAvd>>> {
     let registry = AVD_REGISTRY.lock();
     registry.get(id as usize).cloned()
 }
@@ -2711,11 +2713,11 @@ struct AppleAvdVideoBackend {
     registers: AvdRegisters,
     self_weak: Weak<AppleAvdVideoBackend>,
     watchdog_generation: AtomicUsize,
-    watchdog_timer_id: Mutex<Option<u64>>,
-    process_lock: Mutex<()>,
-    state: Mutex<AvdBackendState>,
-    completion_notifier: Mutex<Option<Weak<dyn VideoCompletionNotifier>>>,
-    interrupt_id: Mutex<Option<InterruptId>>,
+    watchdog_timer_id: IrqSpinLock<Option<TimerHandle>>,
+    process_lock: IrqSpinLock<()>,
+    state: IrqSpinLock<AvdBackendState>,
+    completion_notifier: IrqSpinLock<Option<Weak<dyn VideoCompletionNotifier>>>,
+    interrupt_id: IrqSpinLock<Option<InterruptId>>,
 }
 
 impl AppleAvdVideoBackend {
@@ -2725,15 +2727,15 @@ impl AppleAvdVideoBackend {
             registers,
             self_weak: self_weak.clone(),
             watchdog_generation: AtomicUsize::new(0),
-            watchdog_timer_id: Mutex::new(None),
-            process_lock: Mutex::new(()),
-            state: Mutex::new(AvdBackendState::new()),
-            completion_notifier: Mutex::new(None),
-            interrupt_id: Mutex::new(None),
+            watchdog_timer_id: IrqSpinLock::new(None),
+            process_lock: IrqSpinLock::new(()),
+            state: IrqSpinLock::new(AvdBackendState::new()),
+            completion_notifier: IrqSpinLock::new(None),
+            interrupt_id: IrqSpinLock::new(None),
         })
     }
 
-    fn avd(&self) -> Result<Arc<Mutex<AppleAvd>>, &'static str> {
+    fn avd(&self) -> Result<Arc<IrqSpinLock<AppleAvd>>, &'static str> {
         get_apple_avd(self.avd_id).ok_or("apple-avd: backend instance disappeared")
     }
 
@@ -2816,8 +2818,8 @@ impl AppleAvdVideoBackend {
             .self_weak
             .upgrade()
             .ok_or("apple-avd: watchdog backend disappeared")?;
-        let expires = get_tick().saturating_add(ms_to_ticks(AVD_WATCHDOG_TIMEOUT_MS));
-        let timer_id = add_timer(expires, &handler, generation);
+        let expires = get_time_ns().saturating_add(ms_to_ns(AVD_WATCHDOG_TIMEOUT_MS));
+        let timer_id = add_timer(expires, TimerPrecision::Normal, &handler, generation);
         *self.watchdog_timer_id.lock() = Some(timer_id);
         Ok(())
     }

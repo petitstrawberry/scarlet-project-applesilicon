@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp;
 
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::device::remoteproc::{
     RemoteProcessor, RemoteprocCrashHandler, RemoteprocDmaMapper, RemoteprocError,
@@ -141,15 +141,15 @@ fn mgmt_msg(msg_type: u64, payload: u64) -> u64 {
 /// RTKit protocol context.
 pub struct AppleRtkit {
     asc: Arc<AppleAsc>,
-    iop_power: Arc<Mutex<u32>>,
-    ap_power: Arc<Mutex<u32>>,
-    crashed: Arc<Mutex<bool>>,
-    ep_bitmap: Arc<Mutex<u64>>,
-    firmware_regions: Arc<Mutex<Vec<RemoteprocMemoryRegion>>>,
-    crash_handler: Arc<Mutex<Option<Arc<dyn RemoteprocCrashHandler>>>>,
+    iop_power: Arc<IrqSpinLock<u32>>,
+    ap_power: Arc<IrqSpinLock<u32>>,
+    crashed: Arc<IrqSpinLock<bool>>,
+    ep_bitmap: Arc<IrqSpinLock<u64>>,
+    firmware_regions: Arc<IrqSpinLock<Vec<RemoteprocMemoryRegion>>>,
+    crash_handler: Arc<IrqSpinLock<Option<Arc<dyn RemoteprocCrashHandler>>>>,
     dma_mapper: Option<Arc<dyn RemoteprocDmaMapper>>,
-    syslog_buffers: Arc<Mutex<Vec<SyslogBuffer>>>,
-    pending_messages: Arc<Mutex<VecDeque<RtkitMessage>>>,
+    syslog_buffers: Arc<IrqSpinLock<Vec<SyslogBuffer>>>,
+    pending_messages: Arc<IrqSpinLock<VecDeque<RtkitMessage>>>,
 }
 
 struct SyslogBuffer {
@@ -164,15 +164,15 @@ impl AppleRtkit {
     pub fn new(asc: Arc<AppleAsc>) -> Self {
         Self {
             asc,
-            iop_power: Arc::new(Mutex::new(RTKIT_POWER_OFF)),
-            ap_power: Arc::new(Mutex::new(RTKIT_POWER_OFF)),
-            crashed: Arc::new(Mutex::new(false)),
-            ep_bitmap: Arc::new(Mutex::new(0)),
-            firmware_regions: Arc::new(Mutex::new(Vec::new())),
-            crash_handler: Arc::new(Mutex::new(None)),
+            iop_power: Arc::new(IrqSpinLock::new(RTKIT_POWER_OFF)),
+            ap_power: Arc::new(IrqSpinLock::new(RTKIT_POWER_OFF)),
+            crashed: Arc::new(IrqSpinLock::new(false)),
+            ep_bitmap: Arc::new(IrqSpinLock::new(0)),
+            firmware_regions: Arc::new(IrqSpinLock::new(Vec::new())),
+            crash_handler: Arc::new(IrqSpinLock::new(None)),
             dma_mapper: None,
-            syslog_buffers: Arc::new(Mutex::new(Vec::new())),
-            pending_messages: Arc::new(Mutex::new(VecDeque::new())),
+            syslog_buffers: Arc::new(IrqSpinLock::new(Vec::new())),
+            pending_messages: Arc::new(IrqSpinLock::new(VecDeque::new())),
         }
     }
 
@@ -953,7 +953,7 @@ impl AppleRtkit {
 pub struct AppleRtkitService {
     rtkit: Arc<AppleRtkit>,
     endpoint: u8,
-    client: Mutex<Option<Arc<dyn RemoteprocServiceClient>>>,
+    client: IrqSpinLock<Option<Arc<dyn RemoteprocServiceClient>>>,
 }
 
 impl AppleRtkitService {
@@ -971,7 +971,7 @@ impl AppleRtkitService {
         Self {
             rtkit,
             endpoint,
-            client: Mutex::new(None),
+            client: IrqSpinLock::new(None),
         }
     }
 

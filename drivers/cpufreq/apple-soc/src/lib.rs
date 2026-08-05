@@ -16,8 +16,6 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::Mutex;
-
 use scarlet::arch::mmio;
 use scarlet::device::cpufreq::cpu_performance_domain;
 use scarlet::device::cpufreq::register_backend;
@@ -28,6 +26,7 @@ use scarlet::device::cpufreq::{
     CpuFrequencyPolicyRegistration, MAX_CPUFREQ_OPPS,
 };
 use scarlet::device::fdt::FdtManager;
+use scarlet::sync::IrqSpinLock;
 
 const APPLE_BACKEND_NAME: &str = "apple-soc-cpufreq";
 const APPLE_DVFS_CMD: usize = 0x20;
@@ -51,8 +50,8 @@ const T8103_ECPU_BOOT_PSTATE: u32 = 5;
 const T8103_PCPU_BOOT_PSTATE: u32 = 7;
 
 static SCANNED_FDT: AtomicBool = AtomicBool::new(false);
-static CPUFREQ_DOMAINS: Mutex<[AppleCpuFreqDomain; MAX_CPUFREQ_DOMAINS]> =
-    Mutex::new([AppleCpuFreqDomain::empty(); MAX_CPUFREQ_DOMAINS]);
+static CPUFREQ_DOMAINS: IrqSpinLock<[AppleCpuFreqDomain; MAX_CPUFREQ_DOMAINS]> =
+    IrqSpinLock::new([AppleCpuFreqDomain::empty(); MAX_CPUFREQ_DOMAINS]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PstateEncoding {

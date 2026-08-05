@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::arch::mmio;
 use scarlet::device::mailbox::{
@@ -67,8 +67,8 @@ pub struct AscMessage {
 pub struct AppleAsc {
     base: usize,
     cpu_base: usize,
-    interrupt_id: Mutex<Option<InterruptId>>,
-    pending_messages: Mutex<VecDeque<AscMessage>>,
+    interrupt_id: IrqSpinLock<Option<InterruptId>>,
+    pending_messages: IrqSpinLock<VecDeque<AscMessage>>,
     recv_waker: Waker,
 }
 
@@ -83,7 +83,7 @@ pub struct AppleAsc {
 pub struct AppleAscChannel {
     asc: Arc<AppleAsc>,
     id: MailboxChannelId,
-    client: Mutex<Option<Arc<dyn MailboxClient>>>,
+    client: IrqSpinLock<Option<Arc<dyn MailboxClient>>>,
 }
 
 /// Mailbox controller wrapper for one Apple ASC instance.
@@ -103,8 +103,8 @@ impl AppleAsc {
         Self {
             base,
             cpu_base: base,
-            interrupt_id: Mutex::new(None),
-            pending_messages: Mutex::new(VecDeque::new()),
+            interrupt_id: IrqSpinLock::new(None),
+            pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
         }
     }
@@ -123,8 +123,8 @@ impl AppleAsc {
         Self {
             base,
             cpu_base,
-            interrupt_id: Mutex::new(None),
-            pending_messages: Mutex::new(VecDeque::new()),
+            interrupt_id: IrqSpinLock::new(None),
+            pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
         }
     }
@@ -239,15 +239,15 @@ impl AppleAsc {
                 return Err("apple-asc: recv timeout");
             }
 
-            if self.interrupt_id.lock().is_some()
-                && let Some(task) = scarlet::task::mytask()
-            {
+            let interrupt_driven = self.interrupt_id.lock().is_some();
+            if interrupt_driven && let Some(task) = scarlet::task::mytask() {
                 let remaining = timeout_us - elapsed;
-                let ticks = scarlet::timer::us_to_ticks(remaining).max(1);
+                let timeout_ns = remaining
+                    .saturating_mul(scarlet::timer::NANOSECONDS_PER_MICROSECOND);
                 if !self.recv_waker.wait_with_timeout(
                     task.get_id(),
                     task.get_trapframe(),
-                    Some(ticks),
+                    Some(timeout_ns),
                 ) {
                     return Err("apple-asc: recv timeout");
                 }
@@ -307,7 +307,7 @@ impl AppleAscChannel {
         Self {
             asc,
             id,
-            client: Mutex::new(client),
+            client: IrqSpinLock::new(client),
         }
     }
 
@@ -442,8 +442,8 @@ impl MailboxController for AppleAscMailboxController {
 }
 
 /// Registry of probed ASC mailbox instances.
-static ASC_REGISTRY: Mutex<Vec<Arc<AppleAsc>>> = Mutex::new(Vec::new());
-static ASC_PHANDLE_REGISTRY: Mutex<Vec<(u32, Arc<AppleAsc>)>> = Mutex::new(Vec::new());
+static ASC_REGISTRY: IrqSpinLock<Vec<Arc<AppleAsc>>> = IrqSpinLock::new(Vec::new());
+static ASC_PHANDLE_REGISTRY: IrqSpinLock<Vec<(u32, Arc<AppleAsc>)>> = IrqSpinLock::new(Vec::new());
 
 /// Get a probed ASC mailbox instance by index.
 ///

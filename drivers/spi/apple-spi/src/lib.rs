@@ -14,7 +14,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::arch::mmio;
 use scarlet::device::clk::ClkHandle;
@@ -124,8 +124,8 @@ pub struct AppleSpiController {
     bus_number: u32,
     parent_clock_hz: u32,
     _bus_clk: Option<ClkHandle>,
-    inner: Mutex<AppleSpiInner>,
-    transfer_lock: Mutex<()>,
+    inner: IrqSpinLock<AppleSpiInner>,
+    transfer_lock: IrqSpinLock<()>,
 }
 
 impl AppleSpiController {
@@ -140,12 +140,12 @@ impl AppleSpiController {
             bus_number,
             parent_clock_hz,
             _bus_clk: bus_clk,
-            inner: Mutex::new(AppleSpiInner {
+            inner: IrqSpinLock::new(AppleSpiInner {
                 speed_hz: DEFAULT_BUS_SPEED_HZ,
                 mode: 0,
                 lsb_first: false,
             }),
-            transfer_lock: Mutex::new(()),
+            transfer_lock: IrqSpinLock::new(()),
         };
         controller.init_hardware()?;
         Ok(controller)

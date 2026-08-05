@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::{
     arch::mmio,
@@ -256,17 +256,17 @@ impl ApplePciePort {
     }
 }
 
-static PCIE_REGISTRY: Mutex<alloc::vec::Vec<Arc<Mutex<ApplePciePort>>>> =
-    Mutex::new(alloc::vec::Vec::new());
+static PCIE_REGISTRY: IrqSpinLock<alloc::vec::Vec<Arc<IrqSpinLock<ApplePciePort>>>> =
+    IrqSpinLock::new(alloc::vec::Vec::new());
 
 pub fn register_port(port: ApplePciePort) -> u32 {
     let mut guard = PCIE_REGISTRY.lock();
     let id = guard.len() as u32;
-    guard.push(Arc::new(Mutex::new(port)));
+    guard.push(Arc::new(IrqSpinLock::new(port)));
     id
 }
 
-pub fn get_port(id: u32) -> Option<Arc<Mutex<ApplePciePort>>> {
+pub fn get_port(id: u32) -> Option<Arc<IrqSpinLock<ApplePciePort>>> {
     let guard = PCIE_REGISTRY.lock();
     guard.get(id as usize).cloned()
 }

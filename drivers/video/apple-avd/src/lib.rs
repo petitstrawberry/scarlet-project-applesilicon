@@ -68,7 +68,7 @@ use scarlet::{
     },
     mem::page::ContiguousPages,
     println,
-    sync::{IrqGuard, IrqSpinLock},
+    sync::{IrqGuard, IrqSpinLock, Mutex},
     time,
     timer::{
         TimerHandle, TimerHandler, TimerPrecision, add_timer, cancel_timer, get_time_ns, ms_to_ns,
@@ -1345,7 +1345,7 @@ struct AvdSessionWorkspace {
 
 impl AvdSessionWorkspace {
     fn new_h264(
-        avd: &AppleAvd,
+        dma: &DmaContext,
         layout: h264::AvdFrameLayout,
         slot_count: usize,
     ) -> Result<Self, &'static str> {
@@ -1360,7 +1360,7 @@ impl AvdSessionWorkspace {
                     .ok_or("apple-avd: workspace size overflow")?,
             )
             .ok_or("apple-avd: workspace size overflow")?;
-        let granule = avd.dma_context().mapping_granule().max(AVD_WORKSPACE_ALIGN);
+        let granule = dma.mapping_granule().max(AVD_WORKSPACE_ALIGN);
         let byte_len = align_up(required, granule);
         let page_count = byte_len.div_ceil(PAGE_SIZE);
         let pages = ContiguousPages::new_aligned(page_count, granule)
@@ -1368,8 +1368,7 @@ impl AvdSessionWorkspace {
         // The large reference workspace is device-owned after setup. Drop any
         // stale CPU cache lines once, then only clean CPU-written subranges.
         arch::clean_invalidate_dcache_to_poc_range(pages.as_vaddr(), byte_len);
-        let mapping = avd
-            .dma_context()
+        let mapping = dma
             .map_phys_owned(
                 pages.as_paddr(),
                 byte_len,
@@ -1666,6 +1665,7 @@ impl AvdSessionWorkspace {
 struct AvdBackendSession {
     stream_id: u32,
     active: bool,
+    quarantined: bool,
     coded_format: u32,
     next_frame: u32,
     vp9_frame_state: AvdVp9FrameState,
@@ -1755,6 +1755,7 @@ impl AvdBackendSession {
         Self {
             stream_id: (index + 1) as u32,
             active: false,
+            quarantined: false,
             coded_format: 0,
             next_frame: 0,
             vp9_frame_state: AvdVp9FrameState::new(),
@@ -1773,6 +1774,7 @@ impl AvdBackendSession {
 
     fn reset(&mut self) {
         self.active = false;
+        self.quarantined = false;
         self.coded_format = 0;
         self.next_frame = 0;
         self.vp9_frame_state = AvdVp9FrameState::new();
@@ -1868,6 +1870,20 @@ impl AvdBackendSession {
             .ok_or("apple-avd: workspace unavailable")
     }
 
+    fn mapped_input_dma(
+        &self,
+        paddr: usize,
+        vaddr: usize,
+        len: usize,
+    ) -> Result<u64, &'static str> {
+        let pool = self
+            .input_pool
+            .as_ref()
+            .filter(|pool| pool.matches(paddr, vaddr, len))
+            .ok_or("apple-avd: input DMA resources were not prepared")?;
+        Ok(pool.mapping.dma_addr())
+    }
+
     fn ensure_mapped_input(
         &mut self,
         avd: &AppleAvd,
@@ -1878,18 +1894,14 @@ impl AvdBackendSession {
         let remap_input = self
             .input_pool
             .as_ref()
-            .is_none_or(|pool| pool.paddr != paddr || pool.vaddr != vaddr || pool.len != len);
+            .is_none_or(|pool| !pool.matches(paddr, vaddr, len));
         if remap_input {
-            let mapping = avd
-                .dma_context()
-                .map_phys_owned(paddr, len, IommuMapFlags::READ | IommuMapFlags::COHERENT)
-                .map_err(|_| "apple-avd: input DMA map failed")?;
-            self.input_pool = Some(AvdMappedInputPool {
+            self.input_pool = Some(AvdMappedInputPool::new(
+                avd.dma_context(),
                 paddr,
                 vaddr,
                 len,
-                mapping,
-            });
+            )?);
         }
         Ok(self
             .input_pool
@@ -1940,106 +1952,51 @@ impl AvdBackendSession {
         self.reference_frame_count
     }
 
-    fn prepare_mapped_output(
-        &mut self,
-        avd: &AppleAvd,
+    fn preview_mapped_output(
+        &self,
         request: &VideoBackendDecodeRequest,
-        layout: h264::AvdFrameLayout,
-        stream_parameters: H264StreamParameters,
-        store_reference: bool,
+        plan: AvdH264ResourcePlan,
         is_idr: bool,
     ) -> Result<AvdReferenceOutput, &'static str> {
-        let payload_len = layout.output_len();
-        let slot_span = AVD_OUTPUT_SLOT_PAYLOAD_OFFSET
-            .checked_add(payload_len)
-            .map(|len| align_up(len, AVD_DMA_GRANULE))
-            .ok_or("apple-avd: output slot size overflow")?;
-        let mut dpb_capacity =
-            (stream_parameters.max_num_ref_frames as usize).min(AVD_REFERENCE_FRAME_TABLE_LEN);
-        if store_reference && dpb_capacity == 0 {
-            dpb_capacity = 1;
-        }
-        let minimum_slot_count = dpb_capacity
-            .checked_add(AVD_H264_EXTRA_DECODE_SLOTS)
-            .ok_or("apple-avd: output slot count overflow")?
-            .max(1)
-            .min(AVD_H264_OUTPUT_SLOTS);
-        if payload_len == 0 {
-            return Err("apple-avd: decoded frame exceeds mapped output slot pool");
-        }
-        let max_slot_count_by_output = (request.output_len as usize / slot_span)
-            .max(1)
-            .min(AVD_H264_OUTPUT_SLOTS);
-        if max_slot_count_by_output < minimum_slot_count {
-            return Err("apple-avd: decoded frame exceeds mapped output slot pool");
-        }
-        let slot_count = max_slot_count_by_output;
-        if is_idr {
-            self.clear_reference_frames();
-            self.next_reference_slot = 0;
-        }
-
-        let granule = avd.dma_context().mapping_granule().max(AVD_DMA_GRANULE);
-        let output_map_len = align_up(request.output_len as usize, granule);
-        let remap_output = self.output_pool.as_ref().is_none_or(|pool| {
-            pool.paddr != request.output_paddr
-                || pool.vaddr != request.output_vaddr
-                || pool.len != output_map_len
-        });
-        if remap_output {
-            let mapping = avd
-                .dma_context()
-                .map_phys_owned(
-                    request.output_paddr,
-                    output_map_len,
-                    IommuMapFlags::READ | IommuMapFlags::WRITE | IommuMapFlags::COHERENT,
-                )
-                .map_err(|_| "apple-avd: output DMA map failed")?;
-            self.output_pool = Some(AvdMappedOutputPool {
-                paddr: request.output_paddr,
-                vaddr: request.output_vaddr,
-                len: output_map_len,
-                mapping,
-            });
-            self.clear_reference_frames();
-            self.next_reference_slot = 0;
-            self.reference_slot_len = 0;
-            self.active_slot_count = 0;
-            self.dpb_capacity = 0;
-        }
-
-        let remap_workspace = self
-            .workspace
+        let output_pool = self
+            .output_pool
             .as_ref()
-            .is_none_or(|workspace| !workspace.is_compatible_h264(layout, slot_count));
-        if remap_workspace {
-            self.workspace = Some(AvdSessionWorkspace::new_h264(avd, layout, slot_count)?);
-            self.clear_reference_frames();
-            self.next_reference_slot = 0;
-        }
+            .filter(|pool| {
+                pool.matches(
+                    request.output_paddr,
+                    request.output_vaddr,
+                    plan.output_map_len,
+                )
+            })
+            .ok_or("apple-avd: output DMA resources were not prepared")?;
+        self.workspace
+            .as_ref()
+            .filter(|workspace| workspace.is_compatible_h264(plan.layout, plan.slot_count))
+            .ok_or("apple-avd: H.264 workspace was not prepared")?;
 
-        if self.reference_slot_len != slot_span
-            || self.active_slot_count != slot_count
-            || self.dpb_capacity != dpb_capacity
-        {
-            self.clear_reference_frames();
-            self.next_reference_slot = 0;
-            self.reference_slot_len = slot_span;
-            self.active_slot_count = slot_count;
-            self.dpb_capacity = dpb_capacity;
+        let reset_slot_selection = is_idr
+            || self.reference_slot_len != plan.slot_span
+            || self.active_slot_count != plan.slot_count
+            || self.dpb_capacity != plan.dpb_capacity;
+        let slot = if reset_slot_selection {
+            Some(0)
+        } else {
+            (0..plan.slot_count)
+                .map(|offset| (self.next_reference_slot + offset) % plan.slot_count)
+                .find(|candidate| {
+                    self.reference_frames()
+                        .all(|frame| frame.slot != *candidate)
+                })
         }
-
-        let slot = self
-            .select_free_output_slot(slot_count)
-            .ok_or("apple-avd: no free output reference slot")?;
+        .ok_or("apple-avd: no free output reference slot")?;
         let slot_offset = slot
-            .checked_mul(slot_span)
+            .checked_mul(plan.slot_span)
             .ok_or("apple-avd: output slot offset overflow")?;
         let payload_offset_in_output = slot_offset
             .checked_add(AVD_OUTPUT_SLOT_PAYLOAD_OFFSET)
             .ok_or("apple-avd: output payload offset overflow")?;
         let payload_end = payload_offset_in_output
-            .checked_add(payload_len)
+            .checked_add(plan.payload_len)
             .ok_or("apple-avd: output payload end overflow")?;
         if payload_end > request.output_len as usize {
             return Err("apple-avd: output payload exceeds mapped output slot pool");
@@ -2047,20 +2004,41 @@ impl AvdBackendSession {
         let header_offset_in_output = payload_offset_in_output
             .checked_sub(SCARLET_VIDEO_FRAME_HEADER_LEN)
             .ok_or("apple-avd: output header offset underflow")?;
-        let output_pool = self
-            .output_pool
-            .as_ref()
-            .ok_or("apple-avd: mapped output pool unavailable")?;
         Ok(AvdReferenceOutput {
             slot,
-            slot_count,
-            dpb_capacity,
+            slot_count: plan.slot_count,
+            dpb_capacity: plan.dpb_capacity,
             dma_addr: output_pool.mapping.dma_addr() + payload_offset_in_output as u64,
             vaddr: output_pool.vaddr + payload_offset_in_output,
             header_vaddr: output_pool.vaddr + header_offset_in_output,
             payload_offset: request.output_offset as usize + payload_offset_in_output,
-            len: payload_len,
+            len: plan.payload_len,
         })
+    }
+
+    fn prepare_mapped_output(
+        &mut self,
+        request: &VideoBackendDecodeRequest,
+        plan: AvdH264ResourcePlan,
+        is_idr: bool,
+    ) -> Result<AvdReferenceOutput, &'static str> {
+        let output = self.preview_mapped_output(request, plan, is_idr)?;
+        if is_idr {
+            self.clear_reference_frames();
+            self.next_reference_slot = 0;
+        }
+        if self.reference_slot_len != plan.slot_span
+            || self.active_slot_count != plan.slot_count
+            || self.dpb_capacity != plan.dpb_capacity
+        {
+            self.clear_reference_frames();
+            self.next_reference_slot = 0;
+            self.reference_slot_len = plan.slot_span;
+            self.active_slot_count = plan.slot_count;
+            self.dpb_capacity = plan.dpb_capacity;
+        }
+        self.next_reference_slot = (output.slot + 1) % plan.slot_count;
+        Ok(output)
     }
 
     fn prepare_mapped_output_vp9(
@@ -2351,11 +2329,118 @@ struct AvdMappedInputPool {
     mapping: DmaMapping,
 }
 
+impl AvdMappedInputPool {
+    fn new(dma: &DmaContext, paddr: usize, vaddr: usize, len: usize) -> Result<Self, &'static str> {
+        let mapping = dma
+            .map_phys_owned(paddr, len, IommuMapFlags::READ | IommuMapFlags::COHERENT)
+            .map_err(|_| "apple-avd: input DMA map failed")?;
+        Ok(Self {
+            paddr,
+            vaddr,
+            len,
+            mapping,
+        })
+    }
+
+    fn matches(&self, paddr: usize, vaddr: usize, len: usize) -> bool {
+        self.paddr == paddr && self.vaddr == vaddr && self.len == len
+    }
+}
+
 struct AvdMappedOutputPool {
     paddr: usize,
     vaddr: usize,
     len: usize,
     mapping: DmaMapping,
+}
+
+impl AvdMappedOutputPool {
+    fn new(dma: &DmaContext, paddr: usize, vaddr: usize, len: usize) -> Result<Self, &'static str> {
+        let mapping = dma
+            .map_phys_owned(
+                paddr,
+                len,
+                IommuMapFlags::READ | IommuMapFlags::WRITE | IommuMapFlags::COHERENT,
+            )
+            .map_err(|_| "apple-avd: output DMA map failed")?;
+        Ok(Self {
+            paddr,
+            vaddr,
+            len,
+            mapping,
+        })
+    }
+
+    fn matches(&self, paddr: usize, vaddr: usize, len: usize) -> bool {
+        self.paddr == paddr && self.vaddr == vaddr && self.len == len
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AvdH264ResourcePlan {
+    layout: h264::AvdFrameLayout,
+    input_map_len: usize,
+    output_map_len: usize,
+    payload_len: usize,
+    slot_span: usize,
+    slot_count: usize,
+    dpb_capacity: usize,
+    max_references: usize,
+}
+
+impl AvdH264ResourcePlan {
+    fn new(
+        dma: &DmaContext,
+        request: &VideoBackendDecodeRequest,
+        stream_parameters: H264StreamParameters,
+        store_reference: bool,
+    ) -> Result<Self, &'static str> {
+        let layout = stream_parameters.nv12_layout();
+        let payload_len = layout.output_len();
+        let slot_span = AVD_OUTPUT_SLOT_PAYLOAD_OFFSET
+            .checked_add(payload_len)
+            .map(|len| align_up(len, AVD_DMA_GRANULE))
+            .ok_or("apple-avd: output slot size overflow")?;
+        let mut dpb_capacity =
+            (stream_parameters.max_num_ref_frames as usize).min(AVD_REFERENCE_FRAME_TABLE_LEN);
+        if store_reference && dpb_capacity == 0 {
+            dpb_capacity = 1;
+        }
+        let minimum_slot_count = dpb_capacity
+            .checked_add(AVD_H264_EXTRA_DECODE_SLOTS)
+            .ok_or("apple-avd: output slot count overflow")?
+            .max(1)
+            .min(AVD_H264_OUTPUT_SLOTS);
+        if payload_len == 0 {
+            return Err("apple-avd: decoded frame exceeds mapped output slot pool");
+        }
+        let slot_count = (request.output_len as usize / slot_span)
+            .max(1)
+            .min(AVD_H264_OUTPUT_SLOTS);
+        if slot_count < minimum_slot_count {
+            return Err("apple-avd: decoded frame exceeds mapped output slot pool");
+        }
+
+        let mapping_granule = dma.mapping_granule().max(AVD_DMA_GRANULE);
+        Ok(Self {
+            layout,
+            input_map_len: align_up(AVD_MAPPED_INPUT_BYTES, mapping_granule),
+            output_map_len: align_up(request.output_len as usize, mapping_granule),
+            payload_len,
+            slot_span,
+            slot_count,
+            dpb_capacity,
+            max_references: (stream_parameters.max_num_ref_frames as usize)
+                .min(AVD_REFERENCE_FRAME_TABLE_LEN),
+        })
+    }
+}
+
+#[derive(Default)]
+struct AvdPreparedH264Resources {
+    input_pool: Option<AvdMappedInputPool>,
+    output_pool: Option<AvdMappedOutputPool>,
+    workspace: Option<AvdSessionWorkspace>,
 }
 
 #[derive(Clone, Copy)]
@@ -2596,7 +2681,7 @@ impl AvdBackendState {
         let index = self
             .sessions
             .iter()
-            .position(|session| !session.active)
+            .position(|session| !session.active && !session.quarantined)
             .ok_or("apple-avd: no free video sessions")?;
         self.reset_session_state(index);
         let session = &mut self.sessions[index];
@@ -2607,13 +2692,27 @@ impl AvdBackendState {
         Ok(session.stream_id)
     }
 
-    fn reset_all_sessions(&mut self) {
-        for session in &mut self.sessions {
-            session.reset();
-        }
+    fn quarantine_sessions_after_recovery(&mut self) -> [AvdBackendSession; AVD_MAX_SESSIONS] {
+        let retired = core::array::from_fn(|index| {
+            let active = self.sessions[index].active;
+            let coded_format = self.sessions[index].coded_format;
+            let mut replacement = AvdBackendSession::new(index);
+            if active {
+                // A firmware reset invalidates every hardware-side decode
+                // context, but the frontend still owns its stream ID. Keep
+                // that ownership reserved and force the owner to destroy and
+                // recreate the session instead of allowing the ID to alias a
+                // newly opened frontend.
+                replacement.active = true;
+                replacement.quarantined = true;
+                replacement.coded_format = coded_format;
+            }
+            core::mem::replace(&mut self.sessions[index], replacement)
+        });
         self.pending = None;
         self.irq_completion = None;
         self.completed.clear();
+        retired
     }
 
     fn defer_recovery(&mut self, reason: u64) {
@@ -2650,6 +2749,9 @@ impl AvdBackendState {
         if !session.active {
             return Err("apple-avd: inactive stream id");
         }
+        if session.quarantined {
+            return Err("apple-avd: stream requires recreation after firmware recovery");
+        }
         Ok(session)
     }
 
@@ -2658,12 +2760,7 @@ impl AvdBackendState {
         stream_id: u32,
         coded_format: u32,
     ) -> Result<&mut AvdBackendSession, &'static str> {
-        let index = self.session_index(stream_id)?;
-        let session = &mut self.sessions[index];
-        if !session.active {
-            session.active = true;
-            session.coded_format = coded_format;
-        }
+        let session = self.active_session_mut(stream_id)?;
         if session.coded_format != coded_format {
             return Err("apple-avd: stream format mismatch");
         }
@@ -2682,21 +2779,69 @@ impl AvdBackendState {
             .is_some_and(|pending| pending.stream_id == stream_id))
     }
 
-    fn destroy_session(&mut self, stream_id: u32) -> Result<(), &'static str> {
+    fn relinquish_session(
+        &mut self,
+        stream_id: u32,
+        recovery_reason: u64,
+    ) -> Result<(bool, bool, bool, bool), &'static str> {
         let index = self.session_index(stream_id)?;
         let session = &self.sessions[index];
         if !session.active {
-            return Ok(());
+            return Ok((
+                false,
+                false,
+                self.recovery_reason.is_some(),
+                !self.has_active_sessions(),
+            ));
         }
         let had_pending = self
             .pending
             .as_ref()
             .is_some_and(|pending| pending.stream_id == stream_id);
         if had_pending {
-            let _ = self.pending.take();
+            self.defer_recovery(recovery_reason);
         }
-        self.reset_session_state(index);
-        Ok(())
+
+        // Relinquish frontend ownership immediately, but move resource
+        // destruction out of the IRQ-safe state lock. The process mutex keeps
+        // this temporary quarantine from being allocated concurrently.
+        let session = &mut self.sessions[index];
+        session.active = false;
+        session.quarantined = true;
+        session.coded_format = 0;
+        self.completed.retain(|frame| frame.stream_id != stream_id);
+        Ok((
+            true,
+            had_pending,
+            self.recovery_reason.is_some(),
+            !self.has_active_sessions(),
+        ))
+    }
+
+    fn take_relinquished_session_resources(
+        &mut self,
+        stream_id: u32,
+    ) -> Result<Option<AvdBackendSession>, &'static str> {
+        let index = self.session_index(stream_id)?;
+        if self.sessions[index].active {
+            return Ok(None);
+        }
+        let retired = core::mem::replace(&mut self.sessions[index], AvdBackendSession::new(index));
+        self.completed.retain(|frame| frame.stream_id != stream_id);
+        Ok(Some(retired))
+    }
+
+    fn take_relinquished_frontend_mappings(
+        &mut self,
+        stream_id: u32,
+    ) -> Result<(Option<AvdMappedInputPool>, Option<AvdMappedOutputPool>), &'static str> {
+        let index = self.session_index(stream_id)?;
+        let session = &mut self.sessions[index];
+        if session.active {
+            return Err("apple-avd: cannot retire mappings from an active stream");
+        }
+        session.clear_reference_frames();
+        Ok((session.input_pool.take(), session.output_pool.take()))
     }
 
     fn pending_len(&self) -> usize {
@@ -2714,7 +2859,7 @@ struct AppleAvdVideoBackend {
     self_weak: Weak<AppleAvdVideoBackend>,
     watchdog_generation: AtomicUsize,
     watchdog_timer_id: IrqSpinLock<Option<TimerHandle>>,
-    process_lock: IrqSpinLock<()>,
+    process_lock: Mutex<()>,
     state: IrqSpinLock<AvdBackendState>,
     completion_notifier: IrqSpinLock<Option<Weak<dyn VideoCompletionNotifier>>>,
     interrupt_id: IrqSpinLock<Option<InterruptId>>,
@@ -2728,7 +2873,7 @@ impl AppleAvdVideoBackend {
             self_weak: self_weak.clone(),
             watchdog_generation: AtomicUsize::new(0),
             watchdog_timer_id: IrqSpinLock::new(None),
-            process_lock: IrqSpinLock::new(()),
+            process_lock: Mutex::new(()),
             state: IrqSpinLock::new(AvdBackendState::new()),
             completion_notifier: IrqSpinLock::new(None),
             interrupt_id: IrqSpinLock::new(None),
@@ -2772,15 +2917,25 @@ impl AppleAvdVideoBackend {
         };
 
         self.cancel_watchdog();
-        let avd = self.avd()?;
+        let avd = match self.avd() {
+            Ok(avd) => avd,
+            Err(error) => {
+                let _irq_guard = IrqGuard::new();
+                self.state.lock().recovery_reason = Some(reason);
+                return Err(error);
+            }
+        };
         let result = avd.lock().reset_firmware_after_decode_fault(reason);
         if let Err(error) = result {
             let _irq_guard = IrqGuard::new();
             self.state.lock().recovery_reason = Some(reason);
             return Err(error);
         }
-        let _irq_guard = IrqGuard::new();
-        self.state.lock().reset_all_sessions();
+        let retired_sessions = {
+            let _irq_guard = IrqGuard::new();
+            self.state.lock().quarantine_sessions_after_recovery()
+        };
+        drop(retired_sessions);
         Ok(())
     }
 
@@ -2974,37 +3129,146 @@ impl AppleAvdVideoBackend {
         Ok(())
     }
 
+    fn prepare_h264_session_resources(
+        &self,
+        dma: &DmaContext,
+        request: &VideoBackendDecodeRequest,
+        plan: AvdH264ResourcePlan,
+        is_idr: bool,
+        params: &ScarletVideoH264StatelessParams,
+    ) -> Result<usize, &'static str> {
+        // The caller holds `process_lock`, so session lifecycle and submit
+        // state cannot change while the IRQ-safe locks are released below.
+        // With no pending decode, the IRQ path cannot retire these resources.
+        let input_clean_len = align_up(
+            request.input_len as usize,
+            dma.mapping_granule().max(PAGE_SIZE),
+        );
+        arch::clean_invalidate_dcache_to_poc_range(request.input_vaddr, input_clean_len);
+
+        let (needs_input, needs_output, needs_workspace) = {
+            let _irq_guard = IrqGuard::new();
+            let mut state = self.state.lock();
+            if state.pending.is_some() {
+                return Err("apple-avd: decode already pending");
+            }
+            let session = state.session_for_submit(request.stream_id, request.coded_format)?;
+            (
+                session.input_pool.as_ref().is_none_or(|pool| {
+                    !pool.matches(request.input_paddr, request.input_vaddr, plan.input_map_len)
+                }),
+                session.output_pool.as_ref().is_none_or(|pool| {
+                    !pool.matches(
+                        request.output_paddr,
+                        request.output_vaddr,
+                        plan.output_map_len,
+                    )
+                }),
+                session.workspace.as_ref().is_none_or(|workspace| {
+                    !workspace.is_compatible_h264(plan.layout, plan.slot_count)
+                }),
+            )
+        };
+
+        let mut prepared = AvdPreparedH264Resources::default();
+        if needs_input {
+            prepared.input_pool = Some(AvdMappedInputPool::new(
+                dma,
+                request.input_paddr,
+                request.input_vaddr,
+                plan.input_map_len,
+            )?);
+        }
+        if needs_output {
+            prepared.output_pool = Some(AvdMappedOutputPool::new(
+                dma,
+                request.output_paddr,
+                request.output_vaddr,
+                plan.output_map_len,
+            )?);
+        }
+        if needs_workspace {
+            prepared.workspace = Some(AvdSessionWorkspace::new_h264(
+                dma,
+                plan.layout,
+                plan.slot_count,
+            )?);
+        }
+
+        let mut retired = AvdPreparedH264Resources::default();
+        let install_result = {
+            let _irq_guard = IrqGuard::new();
+            let mut state = self.state.lock();
+            (|| -> Result<(AvdReferenceOutput, usize), &'static str> {
+                if state.pending.is_some() {
+                    return Err("apple-avd: decode already pending");
+                }
+                let session = state.session_for_submit(request.stream_id, request.coded_format)?;
+                if let Some(pool) = prepared.input_pool.take() {
+                    retired.input_pool = session.input_pool.replace(pool);
+                }
+                if let Some(pool) = prepared.output_pool.take() {
+                    retired.output_pool = session.output_pool.replace(pool);
+                    session.clear_reference_frames();
+                    session.next_reference_slot = 0;
+                    session.reference_slot_len = 0;
+                    session.active_slot_count = 0;
+                    session.dpb_capacity = 0;
+                }
+                if let Some(workspace) = prepared.workspace.take() {
+                    retired.workspace = session.workspace.replace(workspace);
+                    session.clear_reference_frames();
+                    session.next_reference_slot = 0;
+                }
+                session.mapped_input_dma(
+                    request.input_paddr,
+                    request.input_vaddr,
+                    plan.input_map_len,
+                )?;
+                let valid_dpb_entries = session
+                    .prune_reference_frames_for_dpb(&params.decode_params.dpb, plan.max_references);
+                let output = session.preview_mapped_output(request, plan, is_idr)?;
+                Ok((output, valid_dpb_entries))
+            })()
+        };
+
+        // DART unmap and page release may sleep or take internal locks. Neither
+        // newly unused nor replaced resources may be dropped under IrqSpinLock.
+        drop(retired);
+        drop(prepared);
+        let (reference_output, valid_dpb_entries) = install_result?;
+        arch::clean_invalidate_dcache_to_poc_range(reference_output.vaddr, reference_output.len);
+        Ok(valid_dpb_entries)
+    }
+
     fn submit_h264_prepared_locked(
         &self,
         avd: &mut AppleAvd,
         state: &mut AvdBackendState,
         request: &VideoBackendDecodeRequest,
         stream_parameters: H264StreamParameters,
+        plan: AvdH264ResourcePlan,
+        valid_dpb_entries: usize,
         params: &ScarletVideoH264StatelessParams,
     ) -> Result<(), &'static str> {
-        let granule = avd.dma_context().mapping_granule().max(PAGE_SIZE);
         let input_vaddr = request.input_vaddr;
         let input_len = request.input_len as usize;
-        let input_clean_len = align_up(input_len, granule);
-        let input_map_len = align_up(AVD_MAPPED_INPUT_BYTES, granule);
-        arch::clean_invalidate_dcache_to_poc_range(input_vaddr, input_clean_len);
 
         let session = state.active_session_mut(request.stream_id)?;
         if session.coded_format != request.coded_format {
             return Err("apple-avd: stream format mismatch");
         }
-        let layout = stream_parameters.nv12_layout();
+        let layout = plan.layout;
         let hardware_payload_len = layout.output_len();
         let display_payload_len =
             nv12_tight_payload_len(stream_parameters.width, stream_parameters.height)?;
         let frame_number = session.next_frame;
         session.next_frame = session.next_frame.wrapping_add(1);
         let log_decode = should_log_decode_progress(frame_number);
-        let input_dma_addr = session.ensure_mapped_input(
-            avd,
+        let input_dma_addr = session.mapped_input_dma(
             request.input_paddr,
             request.input_vaddr,
-            input_map_len,
+            plan.input_map_len,
         )?;
         let input = AvdDmaRange {
             dma_addr: input_dma_addr,
@@ -3016,19 +3280,7 @@ impl AppleAvdVideoBackend {
         let input_bytes =
             unsafe { core::slice::from_raw_parts(input_vaddr as *const u8, input_len) };
         let is_idr = params.decode_params.flags & SCARLET_VIDEO_H264_DECODE_PARAM_FLAG_IDR != 0;
-        let store_reference = params.decode_params.nal_ref_idc != 0;
-        let max_references =
-            (stream_parameters.max_num_ref_frames as usize).min(AVD_REFERENCE_FRAME_TABLE_LEN);
-        let valid_dpb_entries =
-            session.prune_reference_frames_for_dpb(&params.decode_params.dpb, max_references);
-        let reference_output = session.prepare_mapped_output(
-            avd,
-            request,
-            layout,
-            stream_parameters,
-            store_reference,
-            is_idr,
-        )?;
+        let reference_output = session.prepare_mapped_output(request, plan, is_idr)?;
         let output = AvdDmaRange {
             dma_addr: reference_output.dma_addr,
             len: hardware_payload_len,
@@ -3077,8 +3329,6 @@ impl AppleAvdVideoBackend {
                 sps_tile_dma_addr,
             )
         };
-
-        arch::clean_invalidate_dcache_to_poc_range(reference_output.vaddr, reference_output.len);
 
         let status_before =
             avd.prepare_h264_mmio(&decode_request, &instructions, instruction_fifo_dma)?;
@@ -3540,49 +3790,69 @@ impl VideoDecodeBackend for AppleAvdVideoBackend {
 
     fn destroy_session(&self, stream_id: u32) -> Result<(), &'static str> {
         let _process_guard = self.process_lock.lock();
-        self.cancel_watchdog();
-        self.recover_deferred_firmware()?;
-        self.drain_irq_completion()?;
-        let avd = self.avd()?;
-        let (had_pending, status) = {
+        let status = self.registers.decode_status();
+        let (was_active, had_pending, needs_recovery, no_active_sessions) = {
             let _irq_guard = IrqGuard::new();
-            let avd = avd.lock();
             let mut state = self.state.lock();
             let had_pending = state.has_pending_for_stream(stream_id)?;
-            let status = avd.decode_status();
             if had_pending {
-                avd.registers.mask_mailbox_irq();
-                let _ = state.pending.take();
-                state.irq_completion = None;
+                self.registers.mask_mailbox_irq();
             }
-            (had_pending, status)
+            state.relinquish_session(stream_id, u64::from(status))?
         };
+
+        if !was_active && !needs_recovery {
+            return Ok(());
+        }
 
         if had_pending {
             println!(
                 "[apple-avd] destroying stream {} with pending decode; resetting firmware status={:#x}",
                 stream_id, status
             );
-            if let Err(error) = avd
-                .lock()
-                .reset_firmware_after_decode_fault(u64::from(status))
-            {
-                let _irq_guard = IrqGuard::new();
-                self.state.lock().defer_recovery(u64::from(status));
-                return Err(error);
-            }
         }
 
-        let no_active_sessions = {
-            let _irq_guard = IrqGuard::new();
-            let mut state = self.state.lock();
-            state.destroy_session(stream_id)?;
-            !state.has_active_sessions()
-        };
-        if no_active_sessions {
-            avd.lock().shutdown_firmware();
+        // Ownership has already been relinquished above. A pending recovery
+        // remains globally gated on failure, so the stream ID cannot be reused
+        // until a later task-context operation successfully resets firmware.
+        let recovery_result = self.recover_deferred_firmware();
+
+        if recovery_result.is_ok() {
+            // The target has no in-flight DMA: either it never owned pending
+            // work or recovery quiesced it. Move its resources out of the
+            // IRQ-safe state lock because DART unmap and page release are
+            // task-context operations.
+            let retired_session = {
+                let _irq_guard = IrqGuard::new();
+                self.state
+                    .lock()
+                    .take_relinquished_session_resources(stream_id)?
+            };
+            drop(retired_session);
+        } else {
+            // The frontend owns the physical input/output pages and releases
+            // them after close even when backend destruction reports an error.
+            // Keeping their IOVAs mapped would therefore permit stale DMA into
+            // reallocated RAM. Remove only those translations after masking
+            // the source and attempting reset, while retaining the backend-
+            // owned workspace in the quarantined slot until recovery succeeds.
+            let retired_frontend_mappings = {
+                let _irq_guard = IrqGuard::new();
+                self.state
+                    .lock()
+                    .take_relinquished_frontend_mappings(stream_id)?
+            };
+            drop(retired_frontend_mappings);
         }
-        Ok(())
+
+        if no_active_sessions {
+            if recovery_result.is_ok() {
+                if let Ok(avd) = self.avd() {
+                    avd.lock().shutdown_firmware();
+                }
+            }
+        }
+        recovery_result
     }
 
     fn submit_decode(&self, request: &VideoBackendDecodeRequest) -> Result<(), &'static str> {
@@ -3600,13 +3870,27 @@ impl VideoDecodeBackend for AppleAvdVideoBackend {
         self.validate_h264_request(&request.decode)?;
         let stream_parameters = H264StreamParameters::from_stateless_sps(&request.h264.sps)
             .map_err(h264_error_to_str)?;
+        let is_idr =
+            request.h264.decode_params.flags & SCARLET_VIDEO_H264_DECODE_PARAM_FLAG_IDR != 0;
+        let store_reference = request.h264.decode_params.nal_ref_idc != 0;
 
         let avd = self.avd()?;
-        {
+        let dma = {
             let mut avd_guard = avd.lock();
             avd_guard.reset_hardware()?;
             avd_guard.ensure_firmware_running()?;
-        }
+            avd_guard.dma_context().clone()
+        };
+        let plan =
+            AvdH264ResourcePlan::new(&dma, &request.decode, stream_parameters, store_reference)?;
+        let valid_dpb_entries = self.prepare_h264_session_resources(
+            &dma,
+            &request.decode,
+            plan,
+            is_idr,
+            &request.h264,
+        )?;
+
         let _irq_guard = IrqGuard::new();
         let mut avd = avd.lock();
         let mut state = self.state.lock();
@@ -3623,6 +3907,8 @@ impl VideoDecodeBackend for AppleAvdVideoBackend {
             &mut state,
             &request.decode,
             stream_parameters,
+            plan,
+            valid_dpb_entries,
             &request.h264,
         )
     }
@@ -3646,6 +3932,9 @@ impl VideoDecodeBackend for AppleAvdVideoBackend {
         let session_index = state.session_index(stream_id)?;
         if !state.sessions[session_index].active {
             return Err("apple-avd: inactive stream id");
+        }
+        if state.sessions[session_index].quarantined {
+            return Err("apple-avd: stream requires recreation after firmware recovery");
         }
         let Some(index) = state
             .completed

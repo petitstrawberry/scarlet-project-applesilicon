@@ -313,8 +313,70 @@ struct AppleSioInner {
     channels: Vec<SioChannelState>,
     tags: IrqSpinLock<SioTags>,
     descriptors: IrqSpinLock<u64>,
+    tx_lock: Mutex<()>,
     configure_lock: Mutex<()>,
+    issue_lock: Mutex<()>,
     draining: AtomicBool,
+}
+
+static SIO_WORKER_INNER: IrqSpinLock<Option<Weak<AppleSioInner>>> = IrqSpinLock::new(None);
+static SIO_WORKER_PENDING: AtomicBool = AtomicBool::new(false);
+static SIO_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static SIO_WORKER_WAKER: scarlet::sync::Waker =
+    scarlet::sync::Waker::new_uninterruptible("apple-sio-worker");
+
+fn queue_sio_worker() {
+    if !SIO_WORKER_PENDING.swap(true, Ordering::AcqRel) {
+        SIO_WORKER_WAKER.wake_one();
+    }
+}
+
+fn process_deferred_sio_work() -> bool {
+    if !SIO_WORKER_PENDING.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+
+    let inner = SIO_WORKER_INNER.lock().as_ref().and_then(Weak::upgrade);
+    let Some(inner) = inner else {
+        return true;
+    };
+
+    inner.process_messages();
+    inner.issue_ready_transfers();
+    true
+}
+
+fn sio_worker_entry() {
+    loop {
+        while process_deferred_sio_work() {}
+
+        let Some(task) = scarlet::task::mytask() else {
+            scarlet::arch::instruction::idle();
+        };
+        SIO_WORKER_WAKER.wait(task.get_id(), task.get_trapframe());
+    }
+}
+
+fn start_sio_worker() {
+    if SIO_WORKER_INNER
+        .lock()
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .is_none()
+        || SIO_WORKER_STARTED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        return;
+    }
+
+    let task = scarlet::task::new_kernel_task(
+        alloc::string::String::from("apple-sio-worker"),
+        1,
+        sio_worker_entry,
+    );
+    task.init();
+    scarlet::sched::scheduler::add_task(task, 0);
 }
 
 impl AppleSioInner {
@@ -348,6 +410,9 @@ impl AppleSioInner {
     }
 
     fn send_tagged(&self, message: u64, kind: SioTagKind) -> Result<usize, DmaError> {
+        // ASC's AP->IOP queue is a single MMIO FIFO. Serialize writers so a
+        // synchronous control request cannot race a deferred ISSUE write.
+        let _tx_guard = self.tx_lock.lock();
         let tag = self
             .tags
             .lock()
@@ -491,6 +556,11 @@ impl AppleSioInner {
     }
 
     fn send_issue(&self, channel: usize, generation: usize) -> Result<(), DmaError> {
+        let _issue_guard = self.issue_lock.lock();
+        self.send_issue_locked(channel, generation)
+    }
+
+    fn send_issue_locked(&self, channel: usize, generation: usize) -> Result<(), DmaError> {
         let descriptor_slot = {
             let state = self.channel(channel)?;
             if !state.running.load(Ordering::Acquire) || state.error.load(Ordering::Acquire) {
@@ -540,6 +610,25 @@ impl AppleSioInner {
         Ok(())
     }
 
+    fn issue_ready_transfers(&self) {
+        for channel in 0..self.channel_count {
+            let generation = {
+                let transfer = self.channels[channel].transfer.lock();
+                transfer.as_ref().map(|transfer| transfer.generation)
+            };
+            let Some(generation) = generation else {
+                continue;
+            };
+
+            if let Err(error) = self.send_issue(channel, generation) {
+                println!(
+                    "[apple-sio] failed to issue channel {} from worker: {:?}",
+                    channel, error
+                );
+            }
+        }
+    }
+
     fn process_issue_reply(&self, channel: usize, generation: usize, ok: bool) {
         let Some(state) = self.channels.get(channel) else {
             return;
@@ -570,12 +659,8 @@ impl AppleSioInner {
             }
         };
 
-        if queue_more && let Err(error) = self.send_issue(channel, generation) {
-            state.error.store(true, Ordering::Release);
-            println!(
-                "[apple-sio] failed to refill channel {}: {:?}",
-                channel, error
-            );
+        if queue_more {
+            queue_sio_worker();
         }
     }
 
@@ -613,12 +698,11 @@ impl AppleSioInner {
                             && !state.error.load(Ordering::Acquire)
                             && !transfer.issue_pending
                             && transfer.inflight < SIO_MAX_INFLIGHT,
-                        transfer.generation,
                     ))
                 }
             }
         };
-        let Some((visible_completion, queue_more, generation)) = outcome else {
+        let Some((visible_completion, queue_more)) = outcome else {
             println!(
                 "[apple-sio] unexpected report channel={} (no matching in-flight descriptor)",
                 channel
@@ -629,12 +713,8 @@ impl AppleSioInner {
         if visible_completion {
             state.completed_periods.fetch_add(1, Ordering::AcqRel);
         }
-        if queue_more && let Err(error) = self.send_issue(channel, generation) {
-            state.error.store(true, Ordering::Release);
-            println!(
-                "[apple-sio] failed to queue channel {} after report: {:?}",
-                channel, error
-            );
+        if queue_more {
+            queue_sio_worker();
         }
 
         // The audio callback may immediately re-enter take_completed_periods()
@@ -680,7 +760,32 @@ impl AppleSioInner {
         Ok(())
     }
 
+    fn start_channel(&self, index: usize) -> Result<(), DmaError> {
+        let _issue_guard = self.issue_lock.lock();
+        let state = self.channel(index)?;
+        self.process_messages();
+        if state.error.load(Ordering::Acquire) {
+            return Err(DmaError::HardwareError);
+        }
+        if state.running.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let generation = {
+            let mut transfer = state.transfer.lock();
+            let transfer = transfer.as_mut().ok_or(DmaError::NotPrepared)?;
+            transfer.terminated = false;
+            transfer.generation
+        };
+        state.running.store(true, Ordering::Release);
+        if let Err(error) = self.send_issue_locked(index, generation) {
+            state.running.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn stop_channel(&self, index: usize) -> Result<(), DmaError> {
+        let _issue_guard = self.issue_lock.lock();
         let state = self.channel(index)?;
         self.process_messages();
 
@@ -740,15 +845,14 @@ impl AppleSioInner {
     }
 }
 
-struct SioRxHandler {
-    inner: Weak<AppleSioInner>,
-}
+struct SioRxHandler;
 
 impl AscRxReadyHandler for SioRxHandler {
     fn rx_ready(&self) {
-        if let Some(inner) = self.inner.upgrade() {
-            inner.process_messages();
-        }
+        // ASC invokes this callback in hard-IRQ context. Keep it bounded: all
+        // RTKit receive processing, ISSUE transmission, and DMA completion
+        // callbacks run from the dedicated SIO kernel worker.
+        queue_sio_worker();
     }
 }
 
@@ -908,26 +1012,7 @@ impl DmaChannel for AppleSioChannel {
     }
 
     fn start(&self) -> Result<(), DmaError> {
-        let state = self.controller.inner.channel(self.index)?;
-        self.controller.inner.process_messages();
-        if state.error.load(Ordering::Acquire) {
-            return Err(DmaError::HardwareError);
-        }
-        if state.running.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let generation = {
-            let mut transfer = state.transfer.lock();
-            let transfer = transfer.as_mut().ok_or(DmaError::NotPrepared)?;
-            transfer.terminated = false;
-            transfer.generation
-        };
-        state.running.store(true, Ordering::Release);
-        if let Err(error) = self.controller.inner.send_issue(self.index, generation) {
-            state.running.store(false, Ordering::Release);
-            return Err(error);
-        }
-        Ok(())
+        self.controller.inner.start_channel(self.index)
     }
 
     fn stop(&self) -> Result<(), DmaError> {
@@ -964,7 +1049,7 @@ impl DmaChannel for AppleSioChannel {
         if state.error.load(Ordering::Acquire) {
             return Err(DmaError::HardwareError);
         }
-        let (generation, kick) = {
+        let kick = {
             let mut transfer = state.transfer.lock();
             let transfer = transfer.as_mut().ok_or(DmaError::NotPrepared)?;
             if !byte_offset.is_multiple_of(transfer.config.period_len)
@@ -978,16 +1063,13 @@ impl DmaChannel for AppleSioChannel {
                 return Err(DmaError::ChannelBusy);
             }
             transfer.committed |= bit;
-            (
-                transfer.generation,
-                state.running.load(Ordering::Acquire)
-                    && !transfer.terminated
-                    && !transfer.issue_pending
-                    && transfer.inflight < SIO_MAX_INFLIGHT,
-            )
+            state.running.load(Ordering::Acquire)
+                && !transfer.terminated
+                && !transfer.issue_pending
+                && transfer.inflight < SIO_MAX_INFLIGHT
         };
         if kick {
-            self.controller.inner.send_issue(self.index, generation)?;
+            queue_sio_worker();
         }
         Ok(())
     }
@@ -1151,7 +1233,9 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         channels,
         tags: IrqSpinLock::new(SioTags::new()),
         descriptors: IrqSpinLock::new(0),
+        tx_lock: Mutex::new(()),
         configure_lock: Mutex::new(()),
+        issue_lock: Mutex::new(()),
         draining: AtomicBool::new(false),
     });
 
@@ -1186,9 +1270,14 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     // Register only after the boot and setup calls. During RTKit management
     // negotiation, an endpoint-specific callback must not consume HELLO/EPMAP.
-    asc.set_rx_ready_handler(Some(Arc::new(SioRxHandler {
-        inner: Arc::downgrade(&inner),
-    })));
+    {
+        let mut worker_inner = SIO_WORKER_INNER.lock();
+        if worker_inner.as_ref().and_then(Weak::upgrade).is_some() {
+            return Err("apple-sio: only one controller is supported");
+        }
+        *worker_inner = Some(Arc::downgrade(&inner));
+    }
+    asc.set_rx_ready_handler(Some(Arc::new(SioRxHandler)));
 
     let shared_iova = inner.shared.iova;
     let controller = Arc::new(AppleSio { inner });
@@ -1218,6 +1307,7 @@ fn register_driver() {
 }
 
 scarlet::driver_initcall!(register_driver);
+scarlet::late_initcall!(start_sio_worker);
 
 #[used]
 static SCARLET_DRIVER_APPLE_SIO_ANCHOR: fn() = force_link;

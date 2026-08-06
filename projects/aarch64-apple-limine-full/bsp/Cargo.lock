@@ -137,6 +137,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-apple-dpaudio"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-dcpext",
+]
+
+[[package]]
 name = "scarlet-driver-apple-dpxbar"
 version = "0.1.0"
 dependencies = [
@@ -224,6 +232,16 @@ version = "0.1.0"
 dependencies = [
  "scarlet",
  "scarlet-driver-apple-asc",
+]
+
+[[package]]
+name = "scarlet-driver-apple-sio"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-apple-asc",
+ "scarlet-driver-apple-dart",
+ "scarlet-driver-apple-rtkit",
 ]
 
 [[package]]
@@ -344,6 +362,7 @@ dependencies = [
  "scarlet-driver-apple-avd",
  "scarlet-driver-apple-cd321x",
  "scarlet-driver-apple-dart",
+ "scarlet-driver-apple-dpaudio",
  "scarlet-driver-apple-dpxbar",
  "scarlet-driver-apple-dwc3",
  "scarlet-driver-apple-efuse",
@@ -356,6 +375,7 @@ dependencies = [
  "scarlet-driver-apple-pinctrl",
  "scarlet-driver-apple-pmgr",
  "scarlet-driver-apple-rtkit",
+ "scarlet-driver-apple-sio",
  "scarlet-driver-apple-smc",
  "scarlet-driver-apple-spi",
  "scarlet-driver-apple-spi-hid",

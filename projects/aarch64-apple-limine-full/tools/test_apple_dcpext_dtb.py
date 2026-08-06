@@ -65,6 +65,204 @@ class AppleDcpextDtbTests(unittest.TestCase):
         self.assertFalse(changed_again)
         self.assertEqual(second, patched)
 
+    def test_patch_adds_sio_dpaudio_topology(self):
+        patched, changed = apple_dcpext_dtb.patch_dtb_bytes(BASE_DTB.read_bytes())
+        self.assertTrue(changed)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "patched.dtb"
+            output.write_bytes(patched)
+            sio = apple_dcpext_dtb._phandle(output, apple_dcpext_dtb.SIO_PATH)
+            sio_mbox = apple_dcpext_dtb._phandle(
+                output,
+                apple_dcpext_dtb.SIO_MBOX_PATH,
+            )
+            dpaudio1_power = apple_dcpext_dtb._phandle(
+                output,
+                apple_dcpext_dtb.DPAUDIO1_POWER_PATH,
+            )
+
+            self.assertEqual(
+                apple_dcpext_dtb._string_property(
+                    output,
+                    apple_dcpext_dtb.ALIASES_PATH,
+                    "sio",
+                ),
+                apple_dcpext_dtb.SIO_PATH,
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.SIO_PATH,
+                    "mboxes",
+                ),
+                [sio_mbox],
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.DPAUDIO1_PATH,
+                    "dmas",
+                ),
+                [sio, 0x66],
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.DPAUDIO1_PATH,
+                    "power-domains",
+                ),
+                [dpaudio1_power],
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.DPAUDIO1_PATH,
+                    "reset-domains",
+                ),
+                [dpaudio1_power],
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.DPAUDIO1_PATH,
+                    "resets",
+                ),
+                [dpaudio1_power],
+            )
+
+            dpaudio1_endpoint = apple_dcpext_dtb._phandle(
+                output,
+                apple_dcpext_dtb.DPAUDIO1_ENDPOINT_PATH,
+            )
+            dcpext_endpoint = apple_dcpext_dtb._phandle(
+                output,
+                apple_dcpext_dtb.DCPEXT_AUDIO_ENDPOINT_PATH,
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.DPAUDIO1_ENDPOINT_PATH,
+                    "remote-endpoint",
+                ),
+                [dcpext_endpoint],
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.DCPEXT_AUDIO_ENDPOINT_PATH,
+                    "remote-endpoint",
+                ),
+                [dpaudio1_endpoint],
+            )
+
+    def test_patch_preserves_m1n1_sio_firmware_properties(self):
+        patched, changed = apple_dcpext_dtb.patch_dtb_bytes(BASE_DTB.read_bytes())
+        self.assertTrue(changed)
+
+        with tempfile.TemporaryDirectory() as directory:
+            m1n1_dtb = pathlib.Path(directory) / "m1n1.dtb"
+            output = pathlib.Path(directory) / "output.dtb"
+            m1n1_dtb.write_bytes(patched)
+            sio = apple_dcpext_dtb._phandle(
+                m1n1_dtb,
+                apple_dcpext_dtb.SIO_PATH,
+            )
+            fw_region_path = "/reserved-memory/sio-firmware-data@900000000"
+
+            # These are deliberately representative values.  m1n1 owns the
+            # actual reserved-memory phandles, IOVAs, and firmware params.
+            apple_dcpext_dtb._run(
+                [
+                    apple_dcpext_dtb._tool("fdtput"),
+                    "-c",
+                    m1n1_dtb,
+                    fw_region_path,
+                ]
+            )
+            for name, values in (
+                ("phandle", ["0x1234"]),
+                ("reg", ["0x9", "0", "0", "0x4000"]),
+                (
+                    "iommu-addresses",
+                    [f"0x{sio:x}", "0", "0x100000", "0", "0x4000"],
+                ),
+            ):
+                apple_dcpext_dtb._run(
+                    [
+                        apple_dcpext_dtb._tool("fdtput"),
+                        "-t",
+                        "x",
+                        m1n1_dtb,
+                        fw_region_path,
+                        name,
+                        *values,
+                    ]
+                )
+            apple_dcpext_dtb._run(
+                [
+                    apple_dcpext_dtb._tool("fdtput"),
+                    "-t",
+                    "x",
+                    m1n1_dtb,
+                    apple_dcpext_dtb.SIO_PATH,
+                    "memory-region",
+                    "0x1234",
+                ]
+            )
+            apple_dcpext_dtb._run(
+                [
+                    apple_dcpext_dtb._tool("fdtput"),
+                    "-t",
+                    "x",
+                    m1n1_dtb,
+                    apple_dcpext_dtb.SIO_PATH,
+                    "apple,sio-firmware-params",
+                    "0x10",
+                    "0x20",
+                ]
+            )
+            apple_dcpext_dtb._run(
+                [
+                    apple_dcpext_dtb._tool("fdtput"),
+                    "-t",
+                    "s",
+                    m1n1_dtb,
+                    apple_dcpext_dtb.SIO_PATH,
+                    "status",
+                    "okay",
+                ]
+            )
+
+            changed_again = apple_dcpext_dtb.patch_dtb_file(m1n1_dtb, output)
+
+            self.assertFalse(changed_again)
+            self.assertEqual(output.read_bytes(), m1n1_dtb.read_bytes())
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.SIO_PATH,
+                    "memory-region",
+                ),
+                [0x1234],
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    apple_dcpext_dtb.SIO_PATH,
+                    "apple,sio-firmware-params",
+                ),
+                [0x10, 0x20],
+            )
+            self.assertEqual(
+                apple_dcpext_dtb._cells_property(
+                    output,
+                    fw_region_path,
+                    "iommu-addresses",
+                ),
+                [sio, 0, 0x100000, 0, 0x4000],
+            )
+
     def test_patch_migrates_legacy_atc1_fixed_route(self):
         patched, changed = apple_dcpext_dtb.patch_dtb_bytes(BASE_DTB.read_bytes())
         self.assertTrue(changed)

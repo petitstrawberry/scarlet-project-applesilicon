@@ -63,6 +63,16 @@ pub struct AscMessage {
     pub msg1: u32,
 }
 
+/// Notification sink invoked after ASC receive IRQ data has been queued.
+///
+/// The callback runs in interrupt context. Implementations must not sleep and
+/// must avoid calling back while holding locks which can also be acquired by
+/// the ASC receive path.
+pub trait AscRxReadyHandler: Send + Sync {
+    /// Process messages made available by the latest receive interrupt.
+    fn rx_ready(&self);
+}
+
 /// Apple ASC mailbox MMIO driver.
 pub struct AppleAsc {
     base: usize,
@@ -70,6 +80,7 @@ pub struct AppleAsc {
     interrupt_id: IrqSpinLock<Option<InterruptId>>,
     pending_messages: IrqSpinLock<VecDeque<AscMessage>>,
     recv_waker: Waker,
+    rx_ready_handler: IrqSpinLock<Option<Arc<dyn AscRxReadyHandler>>>,
 }
 
 /// Mailbox channel wrapper for one Apple ASC mailbox queue.
@@ -106,6 +117,7 @@ impl AppleAsc {
             interrupt_id: IrqSpinLock::new(None),
             pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
+            rx_ready_handler: IrqSpinLock::new(None),
         }
     }
 
@@ -126,7 +138,17 @@ impl AppleAsc {
             interrupt_id: IrqSpinLock::new(None),
             pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
+            rx_ready_handler: IrqSpinLock::new(None),
         }
+    }
+
+    /// Install an interrupt-context receive notification handler.
+    ///
+    /// ASC still owns and queues the hardware messages before invoking this
+    /// handler. The consumer can therefore use the normal [`Self::recv`] API
+    /// without racing the MMIO FIFO drain performed by the IRQ source.
+    pub fn set_rx_ready_handler(&self, handler: Option<Arc<dyn AscRxReadyHandler>>) {
+        *self.rx_ready_handler.lock() = handler;
     }
 
     /// Start the ASC IOP CPU.
@@ -242,8 +264,8 @@ impl AppleAsc {
             let interrupt_driven = self.interrupt_id.lock().is_some();
             if interrupt_driven && let Some(task) = scarlet::task::mytask() {
                 let remaining = timeout_us - elapsed;
-                let timeout_ns = remaining
-                    .saturating_mul(scarlet::timer::NANOSECONDS_PER_MICROSECOND);
+                let timeout_ns =
+                    remaining.saturating_mul(scarlet::timer::NANOSECONDS_PER_MICROSECOND);
                 if !self.recv_waker.wait_with_timeout(
                     task.get_id(),
                     task.get_trapframe(),
@@ -283,6 +305,10 @@ impl InterruptSource for AppleAsc {
         }
         self.pending_messages.lock().append(&mut received);
         self.recv_waker.wake_all();
+        let handler = self.rx_ready_handler.lock().clone();
+        if let Some(handler) = handler {
+            handler.rx_ready();
+        }
         Ok(InterruptClaim::Handled)
     }
 }

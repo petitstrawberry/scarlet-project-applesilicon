@@ -20,7 +20,9 @@ features = { network = true, user-fpu = true, user-vector = true, hypervisor = f
 "scarlet-driver-apple-i2c" = { path = "../../drivers/i2c/apple-i2c", enabled = true }
 "scarlet-driver-apple-nco" = { path = "../../drivers/clk/apple-nco", enabled = true }
 "scarlet-driver-apple-admac" = { path = "../../drivers/dma/apple-admac", enabled = true }
+"scarlet-driver-apple-sio" = { path = "../../drivers/dma/apple-sio", enabled = true }
 "scarlet-driver-apple-mca" = { path = "../../drivers/audio/apple-mca", enabled = true }
+"scarlet-driver-apple-dpaudio" = { path = "../../drivers/audio/apple-dpaudio", enabled = true }
 "scarlet-driver-cs42l83" = { path = "../../drivers/audio/cs42l83", enabled = true }
 "scarlet-driver-tas5770l" = { path = "../../drivers/audio/tas5770l", enabled = true }
 "scarlet-driver-s5l-uart" = { path = "../../drivers/uart/s5l-uart", enabled = true }

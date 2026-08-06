@@ -1,0 +1,13 @@
+[package]
+name = "scarlet-driver-apple-sio"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }
+scarlet-driver-apple-asc = { path = "../../soc/apple-asc" }
+scarlet-driver-apple-dart = { path = "../../iommu/apple-dart" }
+scarlet-driver-apple-rtkit = { path = "../../soc/apple-rtkit" }

@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: MIT
 """Patch J293 Type-C DCPext topology into an m1n1 payload DTB.
 
-The stock J293 DTB already contains DCPext, its mailbox, and both DARTs, but
-keeps them disabled and does not expose either Type-C connector to DCPext.
-This helper enables the common display resources and advertises both ports;
-the Scarlet driver then selects the controller that negotiated DP Alt Mode.
-No information is taken from the live ADT.
+The stock J293 DTB already contains DCPext, its mailbox, both display DARTs,
+and the SIO DART, but keeps DCPext disabled and omits the SIO/DPAudio nodes
+needed for DisplayPort audio.  This helper enables the common display
+resources, advertises both Type-C ports, and adds the static SIO/DPAudio
+topology.  m1n1 then fills the SIO firmware reservations and parameters from
+the live ADT before handing the tree to Scarlet.
 """
 
 from __future__ import annotations
@@ -30,6 +31,17 @@ DISPEXT0_DART_PATH = "/soc/iommu@271304000"
 DCPEXT_DART_PATH = "/soc/iommu@27130c000"
 DCPEXT_MBOX_PATH = "/soc/mbox@271c08000"
 DCPEXT_PATH = "/soc/dcp@271c00000"
+SIO_DART_PATH = "/soc/iommu@235004000"
+SIO_MBOX_PATH = "/soc/mbox@236408000"
+SIO_PATH = "/soc/sio@236400000"
+DPAUDIO1_PATH = "/soc/audio-controller@238334000"
+DPAUDIO1_ENDPOINT_PATH = DPAUDIO1_PATH + "/ports/port@0/endpoint"
+DCPEXT_AUDIO_ENDPOINT_PATH = DCPEXT_PATH + "/ports/port@0/endpoint"
+AIC_PATH = "/soc/interrupt-controller@23b100000"
+PMGR_PATH = "/soc/power-management@23b700000"
+SIO_POWER_PATH = PMGR_PATH + "/power-controller@1c8"
+SIO_CPU_POWER_PATH = PMGR_PATH + "/power-controller@1d0"
+DPAUDIO1_POWER_PATH = PMGR_PATH + "/power-controller@2f0"
 ATCPHY0_PATH = "/soc/phy@383000000"
 ATCPHY1_PATH = "/soc/phy@503000000"
 TYPEC0_PATH = "/soc/i2c@235010000/usb-pd@38/connector"
@@ -133,6 +145,11 @@ def _require_j293_nodes(dtb: pathlib.Path) -> None:
         DCPEXT_DART_PATH,
         DCPEXT_MBOX_PATH,
         DCPEXT_PATH,
+        SIO_DART_PATH,
+        AIC_PATH,
+        SIO_POWER_PATH,
+        SIO_CPU_POWER_PATH,
+        DPAUDIO1_POWER_PATH,
         ATCPHY0_PATH,
         ATCPHY1_PATH,
         TYPEC0_PATH,
@@ -153,12 +170,22 @@ def dtb_has_dcpext(dtb: pathlib.Path) -> bool:
         dispext0_dart = _phandle(dtb, DISPEXT0_DART_PATH)
         dcpext_dart = _phandle(dtb, DCPEXT_DART_PATH)
         dcpext_mbox = _phandle(dtb, DCPEXT_MBOX_PATH)
+        sio_dart = _phandle(dtb, SIO_DART_PATH)
+        sio_mbox = _phandle(dtb, SIO_MBOX_PATH)
+        sio = _phandle(dtb, SIO_PATH)
+        aic = _phandle(dtb, AIC_PATH)
+        sio_power = _phandle(dtb, SIO_POWER_PATH)
+        sio_cpu_power = _phandle(dtb, SIO_CPU_POWER_PATH)
+        dpaudio1_power = _phandle(dtb, DPAUDIO1_POWER_PATH)
+        dpaudio1_endpoint = _phandle(dtb, DPAUDIO1_ENDPOINT_PATH)
+        dcpext_audio_endpoint = _phandle(dtb, DCPEXT_AUDIO_ENDPOINT_PATH)
     except DcpextDtbError:
         return False
 
     expected_status = (DISPEXT0_DART_PATH, DCPEXT_DART_PATH, DCPEXT_MBOX_PATH, DCPEXT_PATH)
     return (
         _string_property(dtb, ALIASES_PATH, "dcpext") == DCPEXT_PATH
+        and _string_property(dtb, ALIASES_PATH, "sio") == SIO_PATH
         and _cells_property(dtb, TYPEC0_PATH, "displayport") == [dcpext]
         and _cells_property(dtb, TYPEC1_PATH, "displayport") == [dcpext]
         and _cells_property(dtb, DISPLAY_PATH, "iommus")
@@ -172,6 +199,45 @@ def dtb_has_dcpext(dtb: pathlib.Path) -> bool:
         )
         and _cells_property(dtb, DCPEXT_PATH, "iommus") == [dcpext_dart, 0]
         and _cells_property(dtb, DCPEXT_PATH, "mboxes") == [dcpext_mbox]
+        and _string_property(dtb, SIO_DART_PATH, "status") == "okay"
+        and _string_property(dtb, SIO_MBOX_PATH, "compatible")
+        == "apple,t8103-asc-mailbox apple,asc-mailbox-v4"
+        and _string_property(dtb, SIO_MBOX_PATH, "status") == "okay"
+        and _cells_property(dtb, SIO_MBOX_PATH, "reg")
+        == [2, 0x36408000, 0, 0x4000]
+        and _cells_property(dtb, SIO_MBOX_PATH, "interrupt-parent") == [aic]
+        and _cells_property(dtb, SIO_MBOX_PATH, "interrupts")
+        == [0, 640, 4, 0, 641, 4, 0, 642, 4, 0, 643, 4]
+        and _cells_property(dtb, SIO_MBOX_PATH, "#mbox-cells") == [0]
+        and _cells_property(dtb, SIO_MBOX_PATH, "power-domains") == [sio_power]
+        and _string_property(dtb, SIO_PATH, "compatible")
+        == "apple,t8103-sio apple,sio"
+        and _string_property(dtb, SIO_PATH, "status") in ("disabled", "okay")
+        and _cells_property(dtb, SIO_PATH, "reg")
+        == [2, 0x36400000, 0, 0x8000]
+        and _cells_property(dtb, SIO_PATH, "dma-channels") == [128]
+        and _cells_property(dtb, SIO_PATH, "#dma-cells") == [1]
+        and _cells_property(dtb, SIO_PATH, "mboxes") == [sio_mbox]
+        and _cells_property(dtb, SIO_PATH, "iommus") == [sio_dart, 0]
+        and _cells_property(dtb, SIO_PATH, "power-domains") == [sio_cpu_power]
+        and _cells_property(dtb, SIO_PATH, "resets") == [sio_power]
+        and _string_property(dtb, DPAUDIO1_PATH, "compatible")
+        == "apple,t8103-dpaudio apple,dpaudio"
+        and _string_property(dtb, DPAUDIO1_PATH, "status") == "okay"
+        and _cells_property(dtb, DPAUDIO1_PATH, "reg")
+        == [2, 0x38334000, 0, 0x4000]
+        and _cells_property(dtb, DPAUDIO1_PATH, "dmas") == [sio, 0x66]
+        and _string_property(dtb, DPAUDIO1_PATH, "dma-names") == "tx"
+        and _cells_property(dtb, DPAUDIO1_PATH, "power-domains")
+        == [dpaudio1_power]
+        and _cells_property(dtb, DPAUDIO1_PATH, "reset-domains")
+        == [dpaudio1_power]
+        and _cells_property(dtb, DPAUDIO1_PATH, "resets")
+        == [dpaudio1_power]
+        and _cells_property(dtb, DPAUDIO1_ENDPOINT_PATH, "remote-endpoint")
+        == [dcpext_audio_endpoint]
+        and _cells_property(dtb, DCPEXT_AUDIO_ENDPOINT_PATH, "remote-endpoint")
+        == [dpaudio1_endpoint]
         and _has_property(dtb, ATC0_COMMON_PATH, "apple,always-on")
         and _has_property(dtb, ATC1_COMMON_PATH, "apple,always-on")
     )
@@ -182,6 +248,10 @@ def _overlay_dts(dtb: pathlib.Path) -> str:
     dcpext = _phandle(dtb, DCPEXT_PATH)
     disp0_dart = _phandle(dtb, DISP0_DART_PATH)
     dispext0_dart = _phandle(dtb, DISPEXT0_DART_PATH)
+    sio_dart = _phandle(dtb, SIO_DART_PATH)
+    aic = _phandle(dtb, AIC_PATH)
+    sio_power = _phandle(dtb, SIO_POWER_PATH)
+    sio_cpu_power = _phandle(dtb, SIO_CPU_POWER_PATH)
 
     return f"""/dts-v1/;
 /plugin/;
@@ -191,6 +261,7 @@ def _overlay_dts(dtb: pathlib.Path) -> str:
         target-path = "{ALIASES_PATH}";
         __overlay__ {{
             dcpext = "{DCPEXT_PATH}";
+            sio = "{SIO_PATH}";
         }};
     }};
 
@@ -247,6 +318,85 @@ def _overlay_dts(dtb: pathlib.Path) -> str:
     fragment@9 {{
         target-path = "{ATC1_COMMON_PATH}";
         __overlay__ {{ apple,always-on; }};
+    }};
+
+    fragment@10 {{
+        target-path = "{SIO_DART_PATH}";
+        __overlay__ {{ status = "okay"; }};
+    }};
+
+    fragment@11 {{
+        target-path = "{DPAUDIO1_POWER_PATH}";
+        dpaudio1_power: __overlay__ {{ }};
+    }};
+
+    fragment@12 {{
+        target-path = "/soc";
+        __overlay__ {{
+            sio_mbox: mbox@236408000 {{
+                compatible = "apple,t8103-asc-mailbox", "apple,asc-mailbox-v4";
+                reg = <0x2 0x36408000 0x0 0x4000>;
+                interrupt-parent = <0x{aic:x}>;
+                interrupts = <0 640 4>, <0 641 4>, <0 642 4>, <0 643 4>;
+                interrupt-names = "send-empty", "send-not-empty",
+                                  "recv-empty", "recv-not-empty";
+                #mbox-cells = <0>;
+                power-domains = <0x{sio_power:x}>;
+                status = "okay";
+            }};
+
+            sio: sio@236400000 {{
+                compatible = "apple,t8103-sio", "apple,sio";
+                reg = <0x2 0x36400000 0x0 0x8000>;
+                dma-channels = <128>;
+                #dma-cells = <1>;
+                mboxes = <&sio_mbox>;
+                iommus = <0x{sio_dart:x} 0>;
+                power-domains = <0x{sio_cpu_power:x}>;
+                resets = <0x{sio_power:x}>;
+                status = "disabled";
+            }};
+
+            dpaudio1: audio-controller@238334000 {{
+                compatible = "apple,t8103-dpaudio", "apple,dpaudio";
+                reg = <0x2 0x38334000 0x0 0x4000>;
+                dmas = <&sio 0x66>;
+                dma-names = "tx";
+                power-domains = <&dpaudio1_power>;
+                reset-domains = <&dpaudio1_power>;
+                resets = <&dpaudio1_power>;
+                status = "okay";
+
+                ports {{
+                    #address-cells = <1>;
+                    #size-cells = <0>;
+                    port@0 {{
+                        reg = <0>;
+                        dpaudio1_dcp: endpoint {{
+                            remote-endpoint = <&dcpext_audio>;
+                        }};
+                    }};
+                }};
+            }};
+        }};
+    }};
+
+    fragment@13 {{
+        target-path = "{DCPEXT_PATH}";
+        __overlay__ {{
+            #address-cells = <2>;
+            #size-cells = <2>;
+            ports {{
+                #address-cells = <1>;
+                #size-cells = <0>;
+                port@0 {{
+                    reg = <0>;
+                    dcpext_audio: endpoint {{
+                        remote-endpoint = <&dpaudio1_dcp>;
+                    }};
+                }};
+            }};
+        }};
     }};
 }};
 """

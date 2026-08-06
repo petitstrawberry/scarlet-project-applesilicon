@@ -18,6 +18,7 @@ extern crate alloc;
 // DCP and DCPext speak the same IOMFB shared-memory protocol.  Keep one
 // implementation while the display protocol is still housed in the DCP
 // driver; both drivers compile this module against their own RTKit instance.
+mod av_audio;
 #[path = "../../dcp/src/iomfb.rs"]
 mod iomfb;
 
@@ -50,6 +51,8 @@ use scarlet_driver_apple_dpxbar::{log_dpxbar_state, route_t8103_dpphy};
 use scarlet_driver_apple_epic::EpicEndpoint;
 use scarlet_driver_apple_rtkit::AppleRtkit;
 
+use av_audio::DcpAvAudio;
+pub use av_audio::DcpAvAudioCookie;
 use iomfb::{BandwidthRegisters, Iomfb};
 
 const DCP_SYSTEM_EP: u8 = 0x20;
@@ -1009,6 +1012,7 @@ struct AppleDcpExt {
     iomfb_powered: bool,
     _system: EpicEndpoint,
     _dptx: EpicEndpoint,
+    audio: Option<Arc<Mutex<DcpAvAudio>>>,
     dcp_table: Arc<IrqSpinLock<DartPageTable>>,
     dcp_dart: Arc<DartInstance>,
     display_table: Arc<IrqSpinLock<DartPageTable>>,
@@ -1141,6 +1145,75 @@ pub fn present_mirror_buffer(index: usize) -> Result<(), &'static str> {
         .as_mut()
         .ok_or("apple-dcpext: no boot-time external display")?
         .present(index)
+}
+
+/// Whether the boot-time DisplayPort sink exposed a usable AV audio service.
+pub fn external_audio_available() -> bool {
+    DCP_EXT
+        .lock()
+        .as_ref()
+        .and_then(|dcp| dcp.audio.as_ref())
+        .is_some()
+}
+
+fn external_audio_handle() -> Result<Arc<Mutex<DcpAvAudio>>, &'static str> {
+    DCP_EXT
+        .lock()
+        .as_ref()
+        .and_then(|dcp| dcp.audio.as_ref())
+        .cloned()
+        .ok_or("apple-dcpext: DisplayPort audio is unavailable")
+}
+
+/// Whether the connected sink exposes this concrete PCM mode.
+///
+/// This only consults DCP's cached `getElements` response; it does not issue
+/// an EPIC command.
+pub fn external_audio_format_supported(rate_hz: u32, sample_bits: u32, channels: u32) -> bool {
+    let Ok(audio) = external_audio_handle() else {
+        return false;
+    };
+    let supported = audio.lock().supports(rate_hz, sample_bits, channels);
+    supported
+}
+
+/// Select the opaque DCP mode token for a sink-supported PCM format.
+pub fn external_audio_cookie(
+    rate_hz: u32,
+    sample_bits: u32,
+    channels: u32,
+) -> Result<DcpAvAudioCookie, &'static str> {
+    let audio = external_audio_handle()?;
+    let result = audio.lock().cookie(rate_hz, sample_bits, channels);
+    result
+}
+
+/// Configure DCP's DisplayPort audio link for a previously selected mode.
+pub fn external_audio_prepare(cookie: &DcpAvAudioCookie) -> Result<(), &'static str> {
+    let audio = external_audio_handle()?;
+    let result = audio.lock().prepare(cookie);
+    result
+}
+
+/// Start sending a prepared DisplayPort audio mode to the sink.
+pub fn external_audio_start(cookie: &DcpAvAudioCookie) -> Result<(), &'static str> {
+    let audio = external_audio_handle()?;
+    let result = audio.lock().start_link(cookie);
+    result
+}
+
+/// Stop an active DisplayPort audio link.
+pub fn external_audio_stop() -> Result<(), &'static str> {
+    let audio = external_audio_handle()?;
+    let result = audio.lock().stop_link();
+    result
+}
+
+/// Release a stopped DisplayPort audio link configuration.
+pub fn external_audio_unprepare() -> Result<(), &'static str> {
+    let audio = external_audio_handle()?;
+    let result = audio.lock().unprepare();
+    result
 }
 
 fn probe_deferred(message: &'static str) -> Result<(), &'static str> {
@@ -1709,6 +1782,16 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         handoff_maps
     );
 
+    // Audio is optional and must never make a working display disappear.
+    // Start AV only after the external pipeline has published its interfaces.
+    let audio = match DcpAvAudio::start(&rtkit, remoteproc, firmware_13_3) {
+        Ok(audio) => Some(Arc::new(Mutex::new(audio))),
+        Err(error) => {
+            println!("[apple-dcpext] DisplayPort audio unavailable: {}", error);
+            None
+        }
+    };
+
     *DCP_EXT.lock() = Some(AppleDcpExt {
         mode: selected_mode,
         iboot,
@@ -1716,6 +1799,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         iomfb_powered,
         _system: system,
         _dptx: dptx,
+        audio,
         dcp_table,
         dcp_dart,
         display_table,

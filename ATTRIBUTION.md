@@ -38,13 +38,14 @@ derived from those exact revisions.
 | SPI | Linux `drivers/spi/spi-apple.c` | GPL-2.0; `Copyright The Asahi Linux Contributors` |
 | MCA | Linux `sound/soc/apple/mca.c` | GPL-2.0-only; `Copyright (C) The Asahi Linux Contributors` |
 | ADMAC | Linux `drivers/dma/apple-admac.c` | GPL-2.0-only; `Copyright (C) The Asahi Linux Contributors` |
+| SIO DMA | Asahi Linux `drivers/dma/apple-sio.c` | GPL-2.0-only OR MIT; retain the source-specific notice when reusing substantial code |
 | NCO | Linux `drivers/clk/clk-apple-nco.c` | GPL-2.0-only OR MIT; `Copyright (C) The Asahi Linux Contributors` |
 | CPU frequency | Linux `drivers/cpufreq/apple-soc-cpufreq.c` | GPL-2.0-only; `Copyright The Asahi Linux Contributors` |
 | Watchdog | Linux `drivers/watchdog/apple_wdt.c` | GPL-2.0-only OR MIT; `Copyright (C) The Asahi Linux Contributors` |
 | eFuse | Linux `drivers/nvmem/apple-efuses.c` | GPL-2.0-only; `Copyright (C) The Asahi Linux Contributors` |
 | AFK | Asahi Linux `drivers/gpu/drm/apple/afk.c` | GPL-2.0-only OR MIT; `Copyright 2022 Sven Peter <sven@svenpeter.dev>` |
 | EPIC | Asahi Linux `drivers/gpu/drm/apple/systemep.c`, `drivers/gpu/drm/apple/epic/dpavservep.c` | GPL-2.0-only OR MIT; retain the source-specific notices in those files when reusing substantial code |
-| DCP and external display | Asahi Linux `drivers/gpu/drm/apple/dcp.c`, `av.c`, `dptxep.c`, `ibootep.c` | GPL-2.0-only OR MIT; retain the source-specific notices in those files when reusing substantial code |
+| DCP, external display, and DisplayPort audio | Asahi Linux `drivers/gpu/drm/apple/dcp.c`, `audio.c`, `av.c`, `dptxep.c`, `ibootep.c`, `parser.c` | GPL-2.0-only OR MIT; retain the source-specific notices in those files when reusing substantial code |
 
 ## m1n1 references
 

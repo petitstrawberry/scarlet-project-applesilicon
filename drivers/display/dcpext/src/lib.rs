@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use core::mem;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use scarlet::device::DeviceInfo;
 use scarlet::device::graphics::{FramebufferConfig, PixelFormat};
 use scarlet::device::iommu::IommuStreamId;
 use scarlet::device::manager::{DeviceManager, DriverPriority, is_probe_defer, probe_defer};
@@ -285,10 +286,26 @@ fn phandle_reg(phandle: u32, index: usize) -> Option<(usize, usize)> {
     None
 }
 
+const T8103_DCPEXT_CLOCK_FALLBACK_HZ: u64 = 533_333_328;
+
+fn effective_device_clock_frequency(advertised: u64, is_t8103: bool) -> u64 {
+    if advertised != 0 {
+        advertised
+    } else if is_t8103 {
+        // t8103.dtsi leaves clk_dispext0 at zero even though IOMFB requires a
+        // usable upper bound for D408/getClockFrequency.  Fall back to the
+        // frequency advertised for clk_disp0 on this SoC.
+        T8103_DCPEXT_CLOCK_FALLBACK_HZ
+    } else {
+        0
+    }
+}
+
 fn device_clock_frequency(device: &PlatformDeviceInfo) -> u64 {
     let referenced = device
         .property("clocks")
         .and_then(|property| read_be_u32(property.value(), 0));
+    let mut advertised = 0;
     if let Some(phandle) = referenced
         && let Some(fdt) = scarlet::device::fdt::FdtManager::get_manager().get_fdt()
     {
@@ -302,15 +319,31 @@ fn device_clock_frequency(device: &PlatformDeviceInfo) -> u64 {
                     .property("clock-frequency")
                     .and_then(|property| read_be_u32(property.value, 0))
             {
-                return frequency as u64;
+                advertised = frequency as u64;
+                break;
             }
         }
     }
 
-    device
-        .property("clock-frequency")
-        .and_then(|property| read_be_u32(property.value(), 0))
-        .unwrap_or(0) as u64
+    if advertised == 0 {
+        advertised = device
+            .property("clock-frequency")
+            .and_then(|property| read_be_u32(property.value(), 0))
+            .unwrap_or(0) as u64;
+    }
+
+    let is_t8103 = device
+        .compatible()
+        .iter()
+        .any(|compatible| *compatible == "apple,t8103-dcpext");
+    let effective = effective_device_clock_frequency(advertised, is_t8103);
+    if advertised == 0 && effective != 0 {
+        println!(
+            "[apple-dcpext] clk_dispext0 is 0 Hz; using t8103 display clock fallback {} Hz",
+            effective
+        );
+    }
+    effective
 }
 
 fn iomfb_registers(

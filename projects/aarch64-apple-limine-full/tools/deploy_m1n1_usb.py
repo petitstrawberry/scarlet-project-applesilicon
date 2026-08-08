@@ -396,6 +396,8 @@ def runner_command_args(args):
         hex(args.entry_point),
         "--uart-baudrate",
         str(args.uart_baudrate),
+        "--dcpext-dtb-patch",
+        args.dcpext_dtb_patch,
         "--avd-dtb-patch",
         args.avd_dtb_patch,
         "--avd-pmgr",
@@ -634,6 +636,29 @@ def enable_avd_pmgr(args, p):
             warn_or_raise(args.avd_pmgr, f"failed to enable PMGR for {path}: {exc}", exc)
 
 
+def patch_dcpext_guest_payload(args, payload):
+    if args.dcpext_dtb_patch == "off":
+        return payload
+    import apple_dcpext_dtb
+
+    try:
+        patched, changed = apple_dcpext_dtb.patch_payload_bytes(
+            payload,
+            machine=args.machine,
+            m1n1_bin=args.m1n1,
+        )
+        action = "Patched" if changed else "Guest DTB already has"
+        print(f"{action} {args.machine} Type-C DCPext topology")
+        return patched
+    except Exception as exc:
+        warn_or_raise(
+            args.dcpext_dtb_patch,
+            f"Apple DCPext DTB patch skipped: {exc}",
+            exc,
+        )
+        return payload
+
+
 def patch_avd_guest_payload(args, adt, payload):
     if args.avd_dtb_patch == "off":
         return payload
@@ -673,6 +698,7 @@ def start_guest(args):
     hv.init()
 
     payload = args.payload.read_bytes()
+    payload = patch_dcpext_guest_payload(args, payload)
     payload = patch_avd_guest_payload(args, hv.adt, payload)
     enable_avd_pmgr(args, p)
     print(f"Loading guest payload {args.payload} ({len(payload)} bytes)")
@@ -737,10 +763,11 @@ def start_guest_bare(args):
 
     payload_path = args.payload
     payload_tempdir = None
-    payload = args.payload.read_bytes()
+    original_payload = args.payload.read_bytes()
+    payload = patch_dcpext_guest_payload(args, original_payload)
     patched_payload = patch_avd_guest_payload(args, u.adt, payload)
-    if patched_payload != payload:
-        payload_tempdir = tempfile.TemporaryDirectory(prefix="scarlet-avd-payload-")
+    if patched_payload != original_payload:
+        payload_tempdir = tempfile.TemporaryDirectory(prefix="scarlet-runtime-payload-")
         payload_path = pathlib.Path(payload_tempdir.name) / args.payload.name
         payload_path.write_bytes(patched_payload)
         print(f"Prepared runtime-patched bare payload {payload_path}")
@@ -856,6 +883,16 @@ def main():
     parser.add_argument("--image-map-size", type=parse_int, default=DEFAULT_IMAGE_MAP_SIZE, help="U-Boot blkmap window size")
     parser.add_argument("--entry-point", type=parse_int, default=DEFAULT_ENTRY_POINT, help="Raw guest payload entry offset")
     parser.add_argument(
+        "--dcpext-dtb-patch",
+        choices=("auto", "off", "require"),
+        default=env_choice(
+            "SCARLET_DCPEXT_DTB_PATCH",
+            "auto",
+            ("auto", "off", "require"),
+        ),
+        help="Patch fixed J293 Type-C DCPext topology into the guest DTB",
+    )
+    parser.add_argument(
         "--avd-dtb-patch",
         choices=("auto", "off", "require"),
         default=env_choice("SCARLET_AVD_DTB_PATCH", "auto", ("auto", "off", "require")),
@@ -904,9 +941,17 @@ def main():
     try:
         ensure_python_modules(required_python_modules)
         if not args.uart_console_only:
-            ensure_commands(
-                ("llvm-config", "clang", "ld.lld", "llvm-objcopy", "llvm-objdump", "llvm-nm")
-            )
+            required_commands = [
+                "llvm-config",
+                "clang",
+                "ld.lld",
+                "llvm-objcopy",
+                "llvm-objdump",
+                "llvm-nm",
+            ]
+            if args.dcpext_dtb_patch != "off" or args.avd_dtb_patch != "off":
+                required_commands.extend(("dtc", "fdtoverlay", "fdtget"))
+            ensure_commands(required_commands)
     except RuntimeError as exc:
         print(f"deployment environment error: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -15,7 +15,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::{
     arch::mmio,
@@ -115,10 +115,10 @@ impl AppleAdmacTransfer {
 struct AppleAdmacChannelState {
     in_use: AtomicBool,
     running: AtomicBool,
-    transfer: Mutex<Option<AppleAdmacTransfer>>,
-    carveout: Mutex<Option<u32>>,
+    transfer: IrqSpinLock<Option<AppleAdmacTransfer>>,
+    carveout: IrqSpinLock<Option<u32>>,
     completed_periods: AtomicUsize,
-    completion_callback: Mutex<Option<DmaCompletionCallback>>,
+    completion_callback: IrqSpinLock<Option<DmaCompletionCallback>>,
     error: AtomicBool,
 }
 
@@ -127,10 +127,10 @@ impl AppleAdmacChannelState {
         Self {
             in_use: AtomicBool::new(false),
             running: AtomicBool::new(false),
-            transfer: Mutex::new(None),
-            carveout: Mutex::new(None),
+            transfer: IrqSpinLock::new(None),
+            carveout: IrqSpinLock::new(None),
             completed_periods: AtomicUsize::new(0),
-            completion_callback: Mutex::new(None),
+            completion_callback: IrqSpinLock::new(None),
             error: AtomicBool::new(false),
         }
     }
@@ -141,9 +141,9 @@ struct AppleAdmacInner {
     size: usize,
     channel_count: usize,
     irq_index: usize,
-    interrupt_id: Mutex<Option<InterruptId>>,
-    tx_sram: Mutex<AppleAdmacSram>,
-    rx_sram: Mutex<AppleAdmacSram>,
+    interrupt_id: IrqSpinLock<Option<InterruptId>>,
+    tx_sram: IrqSpinLock<AppleAdmacSram>,
+    rx_sram: IrqSpinLock<AppleAdmacSram>,
     channels: Vec<AppleAdmacChannelState>,
     dma_context: DmaContext,
 }
@@ -185,9 +185,9 @@ impl AppleAdmac {
                 size,
                 channel_count,
                 irq_index,
-                interrupt_id: Mutex::new(None),
-                tx_sram: Mutex::new(AppleAdmacSram::new()),
-                rx_sram: Mutex::new(AppleAdmacSram::new()),
+                interrupt_id: IrqSpinLock::new(None),
+                tx_sram: IrqSpinLock::new(AppleAdmacSram::new()),
+                rx_sram: IrqSpinLock::new(AppleAdmacSram::new()),
                 channels,
                 dma_context,
             }),

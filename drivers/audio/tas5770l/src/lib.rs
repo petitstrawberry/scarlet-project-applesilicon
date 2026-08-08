@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::{
     device::{
@@ -95,7 +95,7 @@ const TAS2770_TDM_CFG_REG6_SLOT_MASK: u8 = 0x3f;
 const TAS2770_DIN_PD: u8 = 0x31;
 const TAS2770_DIN_PD_SDOUT: u8 = 1 << 7;
 
-static TAS5770L_CODECS: Mutex<Vec<Arc<Tas5770l>>> = Mutex::new(Vec::new());
+static TAS5770L_CODECS: IrqSpinLock<Vec<Arc<Tas5770l>>> = IrqSpinLock::new(Vec::new());
 
 struct TasGpio {
     controller: Arc<dyn GpioController>,
@@ -146,8 +146,8 @@ struct Tas5770l {
     v_sense_slot: Option<u8>,
     sdout_pull_down: bool,
     sdout_zero_fill: bool,
-    powered: Mutex<bool>,
-    unmuted: Mutex<bool>,
+    powered: IrqSpinLock<bool>,
+    unmuted: IrqSpinLock<bool>,
 }
 
 impl Tas5770l {
@@ -174,8 +174,8 @@ impl Tas5770l {
             v_sense_slot,
             sdout_pull_down,
             sdout_zero_fill,
-            powered: Mutex::new(false),
-            unmuted: Mutex::new(false),
+            powered: IrqSpinLock::new(false),
+            unmuted: IrqSpinLock::new(false),
         }
     }
 

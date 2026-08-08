@@ -52,9 +52,9 @@ dependencies = [
 
 [[package]]
 name = "limine"
-version = "0.6.3"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90b240f611eba0b43bf3e97478d87f12322c6c0f540bdad885c3e8c4a0d57333"
+checksum = "29363c0f37e66e18575fadf7141c56ee7ea04ae5fecbeb25eff303f77af203a9"
 
 [[package]]
 name = "lock_api"
@@ -68,13 +68,13 @@ dependencies = [
 [[package]]
 name = "scarlet"
 version = "0.16.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#73b1ed9e4e6a3767e57e78e332d0381a5a928bd0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#331408d2261b264c77e443a668d13fc6c9407bb1"
 dependencies = [
  "fdt",
  "font8x8",
  "hashbrown",
  "limine",
- "spin",
+ "lock_api",
  "talc",
 ]
 
@@ -137,11 +137,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-apple-dpxbar"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+]
+
+[[package]]
 name = "scarlet-driver-apple-dwc3"
 version = "0.1.0"
 dependencies = [
  "scarlet",
  "scarlet-driver-apple-atcphy",
+ "scarlet-driver-apple-cd321x",
 ]
 
 [[package]]
@@ -219,6 +227,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarlet-driver-apple-sio"
+version = "0.1.0"
+dependencies = [
+ "scarlet",
+ "scarlet-driver-apple-asc",
+ "scarlet-driver-apple-dart",
+ "scarlet-driver-apple-rtkit",
+]
+
+[[package]]
 name = "scarlet-driver-apple-smc"
 version = "0.1.0"
 dependencies = [
@@ -264,7 +282,6 @@ version = "0.1.0"
 dependencies = [
  "fdt",
  "scarlet",
- "spin",
 ]
 
 [[package]]
@@ -284,6 +301,7 @@ dependencies = [
  "scarlet-driver-apple-dart",
  "scarlet-driver-apple-epic",
  "scarlet-driver-apple-rtkit",
+ "scarlet-driver-dcpext",
 ]
 
 [[package]]
@@ -293,16 +311,12 @@ dependencies = [
  "scarlet",
  "scarlet-driver-apple-afk",
  "scarlet-driver-apple-asc",
+ "scarlet-driver-apple-atcphy",
+ "scarlet-driver-apple-cd321x",
  "scarlet-driver-apple-dart",
+ "scarlet-driver-apple-dpxbar",
  "scarlet-driver-apple-epic",
  "scarlet-driver-apple-rtkit",
-]
-
-[[package]]
-name = "scarlet-driver-dpxbar"
-version = "0.1.0"
-dependencies = [
- "scarlet",
 ]
 
 [[package]]
@@ -322,7 +336,7 @@ dependencies = [
 [[package]]
 name = "scarlet-module-prototype"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#73b1ed9e4e6a3767e57e78e332d0381a5a928bd0"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#331408d2261b264c77e443a668d13fc6c9407bb1"
 dependencies = [
  "scarlet",
 ]
@@ -340,6 +354,7 @@ dependencies = [
  "scarlet-driver-apple-avd",
  "scarlet-driver-apple-cd321x",
  "scarlet-driver-apple-dart",
+ "scarlet-driver-apple-dpxbar",
  "scarlet-driver-apple-dwc3",
  "scarlet-driver-apple-efuse",
  "scarlet-driver-apple-epic",
@@ -351,6 +366,7 @@ dependencies = [
  "scarlet-driver-apple-pinctrl",
  "scarlet-driver-apple-pmgr",
  "scarlet-driver-apple-rtkit",
+ "scarlet-driver-apple-sio",
  "scarlet-driver-apple-smc",
  "scarlet-driver-apple-spi",
  "scarlet-driver-apple-spi-hid",
@@ -360,7 +376,6 @@ dependencies = [
  "scarlet-driver-cs42l83",
  "scarlet-driver-dcp",
  "scarlet-driver-dcpext",
- "scarlet-driver-dpxbar",
  "scarlet-driver-s5l-uart",
  "scarlet-driver-tas5770l",
  "scarlet-module-prototype",
@@ -371,15 +386,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "spin"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
-dependencies = [
- "lock_api",
-]
 
 [[package]]
 name = "talc"

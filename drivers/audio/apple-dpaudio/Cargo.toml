@@ -1,5 +1,5 @@
 [package]
-name = "scarlet-driver-cpufreq-apple-soc"
+name = "scarlet-driver-apple-dpaudio"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,4 +8,4 @@ path = "src/lib.rs"
 
 [dependencies]
 scarlet = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet", default-features = false }
-fdt = "0.1.5"
+scarlet-driver-dcpext = { path = "../../display/dcpext" }

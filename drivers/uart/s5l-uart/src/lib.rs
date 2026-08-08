@@ -11,7 +11,7 @@ extern crate alloc;
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
 use core::fmt;
-use scarlet::sync::{Mutex, RwLock};
+use scarlet::sync::{IrqSpinLock, IrqRwSpinLock};
 
 use scarlet::{
     arch::mmio,
@@ -91,10 +91,10 @@ pub struct S5lUart {
     base: usize,
     _uart_clk: Option<ClkHandle>,
     _baud_clk: Option<ClkHandle>,
-    interrupt_id: RwLock<Option<InterruptId>>,
-    tx_lock: Mutex<()>,
-    rx_buffer: Mutex<VecDeque<u8>>,
-    event_emitter: Mutex<DeviceEventEmitter>,
+    interrupt_id: IrqRwSpinLock<Option<InterruptId>>,
+    tx_lock: IrqSpinLock<()>,
+    rx_buffer: IrqSpinLock<VecDeque<u8>>,
+    event_emitter: IrqSpinLock<DeviceEventEmitter>,
 }
 
 impl S5lUart {
@@ -103,10 +103,10 @@ impl S5lUart {
             base,
             _uart_clk: uart_clk,
             _baud_clk: baud_clk,
-            interrupt_id: RwLock::new(None),
-            tx_lock: Mutex::new(()),
-            rx_buffer: Mutex::new(VecDeque::new()),
-            event_emitter: Mutex::new(DeviceEventEmitter::new()),
+            interrupt_id: IrqRwSpinLock::new(None),
+            tx_lock: IrqSpinLock::new(()),
+            rx_buffer: IrqSpinLock::new(VecDeque::new()),
+            event_emitter: IrqSpinLock::new(DeviceEventEmitter::new()),
         }
     }
 

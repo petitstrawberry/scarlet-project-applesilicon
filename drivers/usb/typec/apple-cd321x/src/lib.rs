@@ -15,7 +15,7 @@ use scarlet::{
         usb::{TypecOrientation, TypecPort, TypecPortStatus, UsbDataRole},
     },
     early_println,
-    sync::Mutex,
+    sync::IrqSpinLock,
     time::udelay,
 };
 
@@ -29,9 +29,11 @@ const TPS_REG_VID: u8 = 0x00;
 const TPS_REG_MODE: u8 = 0x03;
 const TPS_REG_CMD1: u8 = 0x08;
 const TPS_REG_DATA1: u8 = 0x09;
+const TPS_REG_INT_EVENT1: u8 = 0x14;
 const TPS_REG_STATUS: u8 = 0x1a;
 const TPS_REG_SYSTEM_POWER_STATE: u8 = 0x20;
 const TPS_REG_POWER_STATUS: u8 = 0x3f;
+const TPS_REG_DP_SID_STATUS: u8 = 0x58;
 const TPS_REG_DATA_STATUS: u8 = 0x5f;
 
 const TPS_SYSTEM_POWER_STATE_S0: u8 = 0;
@@ -44,6 +46,55 @@ const TPS_STATUS_PLUG_UPSIDE_DOWN: u32 = 1 << 4;
 const TPS_DATA_STATUS_USB2_CONNECTION: u32 = 1 << 4;
 const TPS_DATA_STATUS_USB3_CONNECTION: u32 = 1 << 5;
 const TPS_DATA_STATUS_USB_DATA_ROLE: u32 = 1 << 7;
+const TPS_DATA_STATUS_DP_CONNECTION: u32 = 1 << 8;
+const TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK: u32 = 0x3 << 10;
+const CD321X_DATA_STATUS_HPD_IRQ: u32 = 1 << 14;
+const CD321X_DATA_STATUS_HPD_LEVEL: u32 = 1 << 15;
+
+const TPS_DP_ASSIGNMENT_E: u32 = 0;
+const TPS_DP_ASSIGNMENT_F: u32 = 1;
+const TPS_DP_ASSIGNMENT_C: u32 = 2;
+const TPS_DP_ASSIGNMENT_D: u32 = 3;
+const TPS_DP_ASSIGNMENT_A: u32 = 4;
+const TPS_DP_ASSIGNMENT_B: u32 = 6;
+
+/// DisplayPort pin assignment reported by the CD321x DATA_STATUS register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cd321xDisplayPortPinAssignment {
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+}
+
+/// ATC lane layout selected by a negotiated DisplayPort pin assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cd321xDisplayPortLaneMode {
+    /// Four DisplayPort lanes; SuperSpeed USB is unavailable.
+    DisplayPort,
+    /// Two DisplayPort lanes alongside two SuperSpeed USB lanes.
+    Usb3DisplayPort,
+}
+
+/// DisplayPort SID status VDOs read from CD321x register 0x58.
+#[derive(Debug, Clone, Copy)]
+pub struct Cd321xDisplayPortStatus {
+    pub mode_status: u8,
+    pub status_tx: u32,
+    pub status_rx: u32,
+    pub configure: u32,
+    pub mode_data: u32,
+}
+
+/// Read-only controller state used to diagnose Type-C/DisplayPort handoff.
+#[derive(Debug, Clone, Copy)]
+pub struct Cd321xDiagnosticSnapshot {
+    pub interrupt_event1: u64,
+    pub status: TypecPortStatus,
+    pub displayport_status: Option<Cd321xDisplayPortStatus>,
+}
 
 struct AppleCd321x {
     bus: Arc<dyn I2cBus>,
@@ -58,6 +109,7 @@ struct Cd321xSnapshot {
     status: u32,
     power_status: u32,
     data_status: u32,
+    displayport_status: Option<Cd321xDisplayPortStatus>,
 }
 
 impl AppleCd321x {
@@ -161,12 +213,27 @@ impl AppleCd321x {
     }
 
     fn snapshot(&self) -> Result<Cd321xSnapshot, I2cError> {
+        let data_status = self.read_u32(TPS_REG_DATA_STATUS)?;
+        let displayport_status = if data_status & TPS_DATA_STATUS_DP_CONNECTION != 0 {
+            let raw = self.read_exact::<17>(TPS_REG_DP_SID_STATUS)?;
+            Some(Cd321xDisplayPortStatus {
+                mode_status: raw[0],
+                status_tx: u32::from_le_bytes(raw[1..5].try_into().unwrap_or([0; 4])),
+                status_rx: u32::from_le_bytes(raw[5..9].try_into().unwrap_or([0; 4])),
+                configure: u32::from_le_bytes(raw[9..13].try_into().unwrap_or([0; 4])),
+                mode_data: u32::from_le_bytes(raw[13..17].try_into().unwrap_or([0; 4])),
+            })
+        } else {
+            None
+        };
+
         Ok(Cd321xSnapshot {
             vendor_id: self.read_u32(TPS_REG_VID)?,
             mode: self.read_exact::<4>(TPS_REG_MODE)?,
             status: self.read_u32(TPS_REG_STATUS)?,
             power_status: self.read_u32(TPS_REG_POWER_STATUS)?,
-            data_status: self.read_u32(TPS_REG_DATA_STATUS)?,
+            data_status,
+            displayport_status,
         })
     }
 
@@ -291,6 +358,20 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         snapshot.power_status,
         snapshot.data_status,
     );
+    if let Some(displayport) = snapshot.displayport_status {
+        let port_status = AppleCd321x::status_from_snapshot(snapshot);
+        early_println!(
+            "[apple-cd321x] DisplayPort assignment={:?} hpd-level={} hpd-irq={} sid-mode={:#x} status-tx={:#010x} status-rx={:#010x} configure={:#010x} mode-data={:#010x}",
+            displayport_pin_assignment(&port_status),
+            displayport_hpd_level(&port_status),
+            displayport_hpd_irq(&port_status),
+            displayport.mode_status,
+            displayport.status_tx,
+            displayport.status_rx,
+            displayport.configure,
+            displayport.mode_data,
+        );
+    }
 
     let manager = DeviceManager::get_manager();
     for endpoint in manager.endpoint_phandles_for_platform_device(device) {
@@ -323,7 +404,140 @@ fn register_driver() {
     DeviceManager::get_manager().register_driver(Box::new(driver), DriverPriority::Core);
 }
 
-static APPLE_CD321X: Mutex<Vec<Arc<AppleCd321x>>> = Mutex::new(Vec::new());
+static APPLE_CD321X: IrqSpinLock<Vec<Arc<AppleCd321x>>> = IrqSpinLock::new(Vec::new());
+
+/// Return the current status of a CD321x controller in firmware probe order.
+///
+/// Local indices only describe the set of controllers firmware left enabled;
+/// they are not stable hardware port numbers.
+pub fn get_cd321x_status(index: usize) -> Option<Result<TypecPortStatus, &'static str>> {
+    let controller = APPLE_CD321X.lock().get(index).cloned()?;
+    Some(controller.status())
+}
+
+/// Return the current status of the CD321x at a specific I2C address.
+///
+/// Unlike [`get_cd321x_status`], this lookup is stable when firmware disables
+/// an unused Type-C port and the remaining controller is registered at a
+/// different local index.
+pub fn get_cd321x_status_by_address(address: u16) -> Option<Result<TypecPortStatus, &'static str>> {
+    let controller = APPLE_CD321X
+        .lock()
+        .iter()
+        .find(|controller| controller.address.raw() == address)
+        .cloned()?;
+    Some(controller.status())
+}
+
+/// Whether a CD321x status snapshot reports an active DisplayPort alt mode.
+pub fn has_displayport_connection(status: &TypecPortStatus) -> bool {
+    status.connected && status.raw_data_status & TPS_DATA_STATUS_DP_CONNECTION != 0
+}
+
+/// Decode the DisplayPort pin assignment negotiated by the CD321x.
+pub fn displayport_pin_assignment(
+    status: &TypecPortStatus,
+) -> Option<Cd321xDisplayPortPinAssignment> {
+    if !has_displayport_connection(status) {
+        return None;
+    }
+
+    // CD321x stores two assignment bits in DATA_STATUS[11:10].  The DP spec
+    // assignment encoding appends the USB3-present bit as its least
+    // significant bit, matching Fairydust's
+    // TPS_DATA_STATUS_DP_SPEC_PIN_ASSIGNMENT().
+    let encoded = ((status.raw_data_status & TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK) >> 9)
+        | u32::from(status.raw_data_status & TPS_DATA_STATUS_USB3_CONNECTION != 0);
+    match encoded {
+        TPS_DP_ASSIGNMENT_A => Some(Cd321xDisplayPortPinAssignment::A),
+        TPS_DP_ASSIGNMENT_B => Some(Cd321xDisplayPortPinAssignment::B),
+        TPS_DP_ASSIGNMENT_C => Some(Cd321xDisplayPortPinAssignment::C),
+        TPS_DP_ASSIGNMENT_D => Some(Cd321xDisplayPortPinAssignment::D),
+        TPS_DP_ASSIGNMENT_E => Some(Cd321xDisplayPortPinAssignment::E),
+        TPS_DP_ASSIGNMENT_F => Some(Cd321xDisplayPortPinAssignment::F),
+        _ => None,
+    }
+}
+
+/// Convert the negotiated pin assignment to the lane modes supported by the
+/// Apple ATC PHY driver.
+pub fn displayport_lane_mode(
+    status: &TypecPortStatus,
+) -> Result<Option<Cd321xDisplayPortLaneMode>, &'static str> {
+    let Some(assignment) = displayport_pin_assignment(status) else {
+        return if has_displayport_connection(status) {
+            Err("apple-cd321x: invalid DisplayPort pin assignment")
+        } else {
+            Ok(None)
+        };
+    };
+
+    match assignment {
+        Cd321xDisplayPortPinAssignment::C | Cd321xDisplayPortPinAssignment::E => {
+            Ok(Some(Cd321xDisplayPortLaneMode::DisplayPort))
+        }
+        Cd321xDisplayPortPinAssignment::D => Ok(Some(Cd321xDisplayPortLaneMode::Usb3DisplayPort)),
+        Cd321xDisplayPortPinAssignment::A
+        | Cd321xDisplayPortPinAssignment::B
+        | Cd321xDisplayPortPinAssignment::F => {
+            Err("apple-cd321x: unsupported DisplayPort pin assignment")
+        }
+    }
+}
+
+/// Whether the CD321x reports the DisplayPort sink's HPD level as asserted.
+pub fn displayport_hpd_level(status: &TypecPortStatus) -> bool {
+    has_displayport_connection(status) && status.raw_data_status & CD321X_DATA_STATUS_HPD_LEVEL != 0
+}
+
+/// Whether the CD321x reports a pending DisplayPort HPD IRQ pulse.
+pub fn displayport_hpd_irq(status: &TypecPortStatus) -> bool {
+    has_displayport_connection(status) && status.raw_data_status & CD321X_DATA_STATUS_HPD_IRQ != 0
+}
+
+/// Read the DisplayPort SID status for a CD321x at a stable I2C address.
+pub fn get_cd321x_displayport_status_by_address(
+    address: u16,
+) -> Option<Result<Option<Cd321xDisplayPortStatus>, &'static str>> {
+    let controller = APPLE_CD321X
+        .lock()
+        .iter()
+        .find(|controller| controller.address.raw() == address)
+        .cloned()?;
+    Some(
+        controller
+            .snapshot()
+            .map(|snapshot| snapshot.displayport_status)
+            .map_err(|_| "apple-cd321x: failed to read DisplayPort SID status"),
+    )
+}
+
+/// Read the latched interrupt event and current Type-C/DP state without
+/// acknowledging or clearing any CD321x interrupt bits.
+pub fn get_cd321x_diagnostic_snapshot_by_address(
+    address: u16,
+) -> Option<Result<Cd321xDiagnosticSnapshot, &'static str>> {
+    let controller = APPLE_CD321X
+        .lock()
+        .iter()
+        .find(|controller| controller.address.raw() == address)
+        .cloned()?;
+    Some((|| {
+        let interrupt_event1 = u64::from_le_bytes(
+            controller
+                .read_exact::<8>(TPS_REG_INT_EVENT1)
+                .map_err(|_| "apple-cd321x: failed to read INT_EVENT1")?,
+        );
+        let snapshot = controller
+            .snapshot()
+            .map_err(|_| "apple-cd321x: failed to read diagnostic state")?;
+        Ok(Cd321xDiagnosticSnapshot {
+            interrupt_event1,
+            status: AppleCd321x::status_from_snapshot(snapshot),
+            displayport_status: snapshot.displayport_status,
+        })
+    })())
+}
 
 scarlet::driver_initcall!(register_driver);
 

@@ -22,7 +22,7 @@ use scarlet::device::nvmem::NvmemCell;
 use scarlet::device::platform::resource::PlatformDeviceResourceType;
 use scarlet::device::platform::{PlatformDeviceDriver, PlatformDeviceInfo};
 use scarlet::early_println;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 use scarlet::time;
 use scarlet::vm;
 use scarlet_driver_apple_asc::get_apple_asc_by_phandle;
@@ -44,7 +44,7 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 const SMC_KEY_CLKM: u32 = smc_key(*b"CLKM");
 
-static SMC_REGISTRY: Mutex<Vec<Arc<AppleSmc>>> = Mutex::new(Vec::new());
+static SMC_REGISTRY: IrqSpinLock<Vec<Arc<AppleSmc>>> = IrqSpinLock::new(Vec::new());
 
 const fn smc_key(bytes: [u8; 4]) -> u32 {
     ((bytes[0] as u32) << 24)
@@ -75,8 +75,8 @@ pub struct AppleSmc {
     sram_paddr: usize,
     sram_vaddr: usize,
     sram_size: usize,
-    shmem_vaddr: Mutex<Option<usize>>,
-    msg_id: Mutex<u8>,
+    shmem_vaddr: IrqSpinLock<Option<usize>>,
+    msg_id: IrqSpinLock<u8>,
 }
 
 impl AppleSmc {
@@ -86,8 +86,8 @@ impl AppleSmc {
             sram_paddr,
             sram_vaddr,
             sram_size,
-            shmem_vaddr: Mutex::new(None),
-            msg_id: Mutex::new(0),
+            shmem_vaddr: IrqSpinLock::new(None),
+            msg_id: IrqSpinLock::new(0),
         }
     }
 

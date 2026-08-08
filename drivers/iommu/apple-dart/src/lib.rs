@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::{
     arch::{self, mmio},
@@ -299,14 +299,14 @@ impl IommuController for DartInstance {
 
 struct DartBypassDomain {
     dart: Arc<DartInstance>,
-    attached_streams: Mutex<alloc::vec::Vec<u32>>,
+    attached_streams: IrqSpinLock<alloc::vec::Vec<u32>>,
 }
 
 impl DartBypassDomain {
     fn new(dart: Arc<DartInstance>) -> Self {
         Self {
             dart,
-            attached_streams: Mutex::new(alloc::vec::Vec::new()),
+            attached_streams: IrqSpinLock::new(alloc::vec::Vec::new()),
         }
     }
 
@@ -376,8 +376,8 @@ impl IommuDomain for DartBypassDomain {
 /// Apple DART translation domain backed by an owned or firmware page table.
 pub struct DartDomain {
     dart: Arc<DartInstance>,
-    page_table: Mutex<DartPageTable>,
-    attached_streams: Mutex<alloc::vec::Vec<u32>>,
+    page_table: IrqSpinLock<DartPageTable>,
+    attached_streams: IrqSpinLock<alloc::vec::Vec<u32>>,
     firmware_stream: Option<u32>,
 }
 
@@ -397,8 +397,8 @@ impl DartDomain {
 
         Ok(Self {
             dart,
-            page_table: Mutex::new(page_table),
-            attached_streams: Mutex::new(alloc::vec::Vec::new()),
+            page_table: IrqSpinLock::new(page_table),
+            attached_streams: IrqSpinLock::new(alloc::vec::Vec::new()),
             firmware_stream: None,
         })
     }
@@ -438,8 +438,8 @@ impl DartDomain {
 
         Ok(Self {
             dart,
-            page_table: Mutex::new(page_table),
-            attached_streams: Mutex::new(alloc::vec![stream.id]),
+            page_table: IrqSpinLock::new(page_table),
+            attached_streams: IrqSpinLock::new(alloc::vec![stream.id]),
             firmware_stream: Some(stream.id),
         })
     }
@@ -975,7 +975,7 @@ struct DartEntry {
     phandle: u32,
 }
 
-static DART_REGISTRY: Mutex<alloc::vec::Vec<DartEntry>> = Mutex::new(alloc::vec::Vec::new());
+static DART_REGISTRY: IrqSpinLock<alloc::vec::Vec<DartEntry>> = IrqSpinLock::new(alloc::vec::Vec::new());
 
 /// Register a DART instance in the legacy Apple DART registry.
 ///

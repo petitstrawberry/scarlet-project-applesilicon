@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::arch::mmio;
 use scarlet::device::mailbox::{
@@ -63,13 +63,24 @@ pub struct AscMessage {
     pub msg1: u32,
 }
 
+/// Notification sink invoked after ASC receive IRQ data has been queued.
+///
+/// The callback runs in interrupt context. Implementations must not sleep and
+/// must avoid calling back while holding locks which can also be acquired by
+/// the ASC receive path.
+pub trait AscRxReadyHandler: Send + Sync {
+    /// Process messages made available by the latest receive interrupt.
+    fn rx_ready(&self);
+}
+
 /// Apple ASC mailbox MMIO driver.
 pub struct AppleAsc {
     base: usize,
     cpu_base: usize,
-    interrupt_id: Mutex<Option<InterruptId>>,
-    pending_messages: Mutex<VecDeque<AscMessage>>,
+    interrupt_id: IrqSpinLock<Option<InterruptId>>,
+    pending_messages: IrqSpinLock<VecDeque<AscMessage>>,
     recv_waker: Waker,
+    rx_ready_handler: IrqSpinLock<Option<Arc<dyn AscRxReadyHandler>>>,
 }
 
 /// Mailbox channel wrapper for one Apple ASC mailbox queue.
@@ -83,7 +94,7 @@ pub struct AppleAsc {
 pub struct AppleAscChannel {
     asc: Arc<AppleAsc>,
     id: MailboxChannelId,
-    client: Mutex<Option<Arc<dyn MailboxClient>>>,
+    client: IrqSpinLock<Option<Arc<dyn MailboxClient>>>,
 }
 
 /// Mailbox controller wrapper for one Apple ASC instance.
@@ -103,9 +114,10 @@ impl AppleAsc {
         Self {
             base,
             cpu_base: base,
-            interrupt_id: Mutex::new(None),
-            pending_messages: Mutex::new(VecDeque::new()),
+            interrupt_id: IrqSpinLock::new(None),
+            pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
+            rx_ready_handler: IrqSpinLock::new(None),
         }
     }
 
@@ -123,10 +135,20 @@ impl AppleAsc {
         Self {
             base,
             cpu_base,
-            interrupt_id: Mutex::new(None),
-            pending_messages: Mutex::new(VecDeque::new()),
+            interrupt_id: IrqSpinLock::new(None),
+            pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
+            rx_ready_handler: IrqSpinLock::new(None),
         }
+    }
+
+    /// Install an interrupt-context receive notification handler.
+    ///
+    /// ASC still owns and queues the hardware messages before invoking this
+    /// handler. The consumer can therefore use the normal [`Self::recv`] API
+    /// without racing the MMIO FIFO drain performed by the IRQ source.
+    pub fn set_rx_ready_handler(&self, handler: Option<Arc<dyn AscRxReadyHandler>>) {
+        *self.rx_ready_handler.lock() = handler;
     }
 
     /// Start the ASC IOP CPU.
@@ -239,15 +261,15 @@ impl AppleAsc {
                 return Err("apple-asc: recv timeout");
             }
 
-            if self.interrupt_id.lock().is_some()
-                && let Some(task) = scarlet::task::mytask()
-            {
+            let interrupt_driven = self.interrupt_id.lock().is_some();
+            if interrupt_driven && let Some(task) = scarlet::task::mytask() {
                 let remaining = timeout_us - elapsed;
-                let ticks = scarlet::timer::us_to_ticks(remaining).max(1);
+                let timeout_ns =
+                    remaining.saturating_mul(scarlet::timer::NANOSECONDS_PER_MICROSECOND);
                 if !self.recv_waker.wait_with_timeout(
                     task.get_id(),
                     task.get_trapframe(),
-                    Some(ticks),
+                    Some(timeout_ns),
                 ) {
                     return Err("apple-asc: recv timeout");
                 }
@@ -283,6 +305,10 @@ impl InterruptSource for AppleAsc {
         }
         self.pending_messages.lock().append(&mut received);
         self.recv_waker.wake_all();
+        let handler = self.rx_ready_handler.lock().clone();
+        if let Some(handler) = handler {
+            handler.rx_ready();
+        }
         Ok(InterruptClaim::Handled)
     }
 }
@@ -307,7 +333,7 @@ impl AppleAscChannel {
         Self {
             asc,
             id,
-            client: Mutex::new(client),
+            client: IrqSpinLock::new(client),
         }
     }
 
@@ -442,8 +468,8 @@ impl MailboxController for AppleAscMailboxController {
 }
 
 /// Registry of probed ASC mailbox instances.
-static ASC_REGISTRY: Mutex<Vec<Arc<AppleAsc>>> = Mutex::new(Vec::new());
-static ASC_PHANDLE_REGISTRY: Mutex<Vec<(u32, Arc<AppleAsc>)>> = Mutex::new(Vec::new());
+static ASC_REGISTRY: IrqSpinLock<Vec<Arc<AppleAsc>>> = IrqSpinLock::new(Vec::new());
+static ASC_PHANDLE_REGISTRY: IrqSpinLock<Vec<(u32, Arc<AppleAsc>)>> = IrqSpinLock::new(Vec::new());
 
 /// Get a probed ASC mailbox instance by index.
 ///

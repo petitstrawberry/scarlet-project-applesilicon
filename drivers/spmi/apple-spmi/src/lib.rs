@@ -22,7 +22,7 @@ use scarlet::device::nvmem::{NvmemError, NvmemProvider};
 use scarlet::device::platform::resource::PlatformDeviceResourceType;
 use scarlet::device::platform::{PlatformDeviceDriver, PlatformDeviceInfo};
 use scarlet::early_println;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 use scarlet::time;
 use scarlet::vm;
 
@@ -164,7 +164,7 @@ impl NvmemProvider for AppleSpmiNvmem {
     }
 }
 
-static SPMI_REGISTRY: Mutex<Vec<Arc<AppleSpmi>>> = Mutex::new(Vec::new());
+static SPMI_REGISTRY: IrqSpinLock<Vec<Arc<AppleSpmi>>> = IrqSpinLock::new(Vec::new());
 
 fn read_be_u32_cells(bytes: &[u8]) -> Option<Vec<u32>> {
     if !bytes.len().is_multiple_of(4) {

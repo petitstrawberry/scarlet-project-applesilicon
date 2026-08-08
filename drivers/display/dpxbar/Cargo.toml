@@ -1,5 +1,5 @@
 [package]
-name = "scarlet-driver-dpxbar"
+name = "scarlet-driver-apple-dpxbar"
 version = "0.1.0"
 edition = "2024"
 

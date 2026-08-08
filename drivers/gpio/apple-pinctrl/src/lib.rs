@@ -7,7 +7,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::arch::mmio::{read32, write32};
 use scarlet::device::{
@@ -53,8 +53,8 @@ static GPIO_VALUE_LOGS: AtomicU32 = AtomicU32::new(0);
 pub struct ApplePinctrl {
     base: usize,
     npins: u32,
-    parent_irqs: Mutex<Vec<InterruptId>>,
-    irq_handlers: Mutex<BTreeMap<u32, Arc<dyn InterruptCapableDevice>>>,
+    parent_irqs: IrqSpinLock<Vec<InterruptId>>,
+    irq_handlers: IrqSpinLock<BTreeMap<u32, Arc<dyn InterruptCapableDevice>>>,
 }
 
 struct ApplePinctrlParentIrq {
@@ -86,8 +86,8 @@ impl ApplePinctrl {
         Self {
             base,
             npins,
-            parent_irqs: Mutex::new(Vec::new()),
-            irq_handlers: Mutex::new(BTreeMap::new()),
+            parent_irqs: IrqSpinLock::new(Vec::new()),
+            irq_handlers: IrqSpinLock::new(BTreeMap::new()),
         }
     }
 

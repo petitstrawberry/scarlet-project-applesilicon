@@ -17,6 +17,7 @@ const ENDPOINT: u8 = 0x37;
 const SHMEM_SIZE: usize = 0x10_0000;
 const PACKET_ALIGNMENT: usize = 0x40;
 const REPLY_TIMEOUT_US: u64 = 5_000_000;
+const LOG_CALLBACK_ACKS: bool = false;
 
 const MESSAGE_TYPE_MASK: u64 = 0xf;
 const MESSAGE_TYPE_SET_SHMEM: u64 = 0;
@@ -104,6 +105,16 @@ pub struct BandwidthRegisters {
     pub doorbell: u64,
     /// Doorbell bit assigned to this DCP instance.
     pub doorbell_bit: u32,
+}
+
+/// Destination rectangle used when the DCP compositor scales a scanout
+/// surface onto the physical panel.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 fn bytes_of<T>(value: &T) -> &[u8] {
@@ -212,6 +223,48 @@ impl Iomfb {
         self.rtkit
             .recv_endpoint_timeout(ENDPOINT, &mut message, timeout_us)?;
         Ok(message.msg)
+    }
+
+    /// Process at most one pending IOMFB message without blocking.
+    ///
+    /// Some iBoot EPIC commands synchronously trigger an IOMFB callback before
+    /// their own reply is published.  DCP clients must therefore keep endpoint
+    /// 0x37 moving while they wait on another endpoint.
+    pub fn poll_nonblocking(&mut self) -> Result<bool, &'static str> {
+        let mut message = RtkitMessage { ep: 0, msg: 0 };
+        if !self.rtkit.recv_endpoint(ENDPOINT, &mut message)? {
+            return Ok(false);
+        }
+        if message.msg & MESSAGE_TYPE_MASK != MESSAGE_TYPE_RPC {
+            return Ok(true);
+        }
+
+        let (context, offset, length, ack) = Self::parse_rpc(message.msg);
+        if !ack {
+            let base = Self::channel_offset(context)?
+                .checked_add(offset)
+                .ok_or("apple-dcp: IOMFB callback offset overflow")?;
+            scarlet::arch::invalidate_dcache_to_poc_range(
+                self.shmem.as_ptr() as usize + base,
+                length,
+            );
+            self.handle_callback(context, offset, length)?;
+            if LOG_CALLBACK_ACKS {
+                let header = self.packet_header(base)?;
+                let tag = [header.tag[3], header.tag[2], header.tag[1], header.tag[0]];
+                println!(
+                    "[apple-dcp] cooperative IOMFB callback ACK tag={}{}{}{} context={} offset={:#x} length={}",
+                    tag[0] as char,
+                    tag[1] as char,
+                    tag[2] as char,
+                    tag[3] as char,
+                    context,
+                    offset,
+                    length
+                );
+            }
+        }
+        Ok(true)
     }
 
     fn shared_slice(&self, offset: usize, length: usize) -> Result<&[u8], &'static str> {
@@ -1007,9 +1060,10 @@ impl Iomfb {
     ///
     /// * `swap_id` - Identifier returned by [`Self::swap_start`].
     /// * `surface_dva` - DCP-visible address of the surface.
-    /// * `width` - Surface and destination width.
-    /// * `height` - Surface and destination height.
+    /// * `width` - Source surface width.
+    /// * `height` - Source surface height.
     /// * `stride` - Surface row stride in bytes.
+    /// * `destination` - Scaled destination rectangle on the physical panel.
     ///
     /// # Returns
     ///
@@ -1022,6 +1076,7 @@ impl Iomfb {
         width: u32,
         height: u32,
         stride: u32,
+        destination: OutputRect,
     ) -> Result<(), &'static str> {
         let (submit_size, surface_size, surfaces_offset, surface_iova_offset) =
             if self.firmware_12_3 {
@@ -1045,10 +1100,10 @@ impl Iomfb {
         write_u32(&mut request, 136, 0);
         write_u32(&mut request, 140, width);
         write_u32(&mut request, 144, height);
-        write_u32(&mut request, 228, 0);
-        write_u32(&mut request, 232, 0);
-        write_u32(&mut request, 236, width);
-        write_u32(&mut request, 240, height);
+        write_u32(&mut request, 228, destination.x);
+        write_u32(&mut request, 232, destination.y);
+        write_u32(&mut request, 236, destination.width);
+        write_u32(&mut request, 240, destination.height);
         let clear_boot_surfaces = !self.surfaces_cleared;
         let swap_mask = if clear_boot_surfaces {
             SWAP_SET_BACKGROUND | 0x7

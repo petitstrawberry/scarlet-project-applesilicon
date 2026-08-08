@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::{
     device::{
@@ -412,7 +412,7 @@ const PLL_RATIO_TABLE: &[Cs42l83PllParams] = &[
     },
 ];
 
-static CS42L83_CODECS: Mutex<Vec<Arc<Cs42l83>>> = Mutex::new(Vec::new());
+static CS42L83_CODECS: IrqSpinLock<Vec<Arc<Cs42l83>>> = IrqSpinLock::new(Vec::new());
 
 struct CsGpio {
     controller: Arc<dyn GpioController>,
@@ -441,10 +441,10 @@ struct Cs42l83 {
     address: I2cAddress,
     bus_phandle: u32,
     reset_gpio: Option<CsGpio>,
-    page: Mutex<u8>,
-    pll_config: Mutex<Option<Cs42l83PllParams>>,
-    powered: Mutex<bool>,
-    stream_active: Mutex<bool>,
+    page: IrqSpinLock<u8>,
+    pll_config: IrqSpinLock<Option<Cs42l83PllParams>>,
+    powered: IrqSpinLock<bool>,
+    stream_active: IrqSpinLock<bool>,
 }
 
 impl Cs42l83 {
@@ -459,10 +459,10 @@ impl Cs42l83 {
             address,
             bus_phandle,
             reset_gpio,
-            page: Mutex::new(0),
-            pll_config: Mutex::new(None),
-            powered: Mutex::new(false),
-            stream_active: Mutex::new(false),
+            page: IrqSpinLock::new(0),
+            pll_config: IrqSpinLock::new(None),
+            powered: IrqSpinLock::new(false),
+            stream_active: IrqSpinLock::new(false),
         }
     }
 

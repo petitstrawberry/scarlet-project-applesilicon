@@ -13,3 +13,6 @@ scarlet-driver-apple-asc = { path = "../../soc/apple-asc" }
 scarlet-driver-apple-rtkit = { path = "../../soc/apple-rtkit" }
 scarlet-driver-apple-afk = { path = "../../soc/apple-afk" }
 scarlet-driver-apple-epic = { path = "../../soc/apple-epic" }
+scarlet-driver-apple-atcphy = { path = "../../phy/apple-atcphy" }
+scarlet-driver-apple-cd321x = { path = "../../usb/typec/apple-cd321x" }
+scarlet-driver-apple-dpxbar = { path = "../dpxbar" }

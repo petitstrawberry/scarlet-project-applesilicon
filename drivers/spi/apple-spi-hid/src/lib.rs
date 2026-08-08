@@ -7,7 +7,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::device::events::InterruptCapableDevice;
 use scarlet::device::gpio::GpioIrqTrigger;
@@ -248,15 +248,15 @@ pub struct AppleSpiHidTransport {
     irq_gpio: (u32, Option<Arc<dyn scarlet::device::gpio::GpioController>>),
     irq_id: Option<InterruptId>,
     irq_trigger: GpioIrqTrigger,
-    msg_id: Mutex<u8>,
-    booted: Mutex<bool>,
-    ready: Mutex<bool>,
-    last_modifiers: Mutex<u8>,
-    last_keys: Mutex<[u8; 6]>,
-    last_buttons: Mutex<u8>,
-    last_touch: Mutex<Option<(i16, i16)>>,
-    key_press_time: Mutex<u64>,
-    last_repeat_time: Mutex<u64>,
+    msg_id: IrqSpinLock<u8>,
+    booted: IrqSpinLock<bool>,
+    ready: IrqSpinLock<bool>,
+    last_modifiers: IrqSpinLock<u8>,
+    last_keys: IrqSpinLock<[u8; 6]>,
+    last_buttons: IrqSpinLock<u8>,
+    last_touch: IrqSpinLock<Option<(i16, i16)>>,
+    key_press_time: IrqSpinLock<u64>,
+    last_repeat_time: IrqSpinLock<u64>,
 }
 
 impl AppleSpiHidTransport {
@@ -280,15 +280,15 @@ impl AppleSpiHidTransport {
             irq_gpio,
             irq_id: None,
             irq_trigger,
-            msg_id: Mutex::new(0),
-            booted: Mutex::new(false),
-            ready: Mutex::new(false),
-            last_modifiers: Mutex::new(0),
-            last_keys: Mutex::new([0; 6]),
-            last_buttons: Mutex::new(0),
-            last_touch: Mutex::new(None),
-            key_press_time: Mutex::new(0),
-            last_repeat_time: Mutex::new(0),
+            msg_id: IrqSpinLock::new(0),
+            booted: IrqSpinLock::new(false),
+            ready: IrqSpinLock::new(false),
+            last_modifiers: IrqSpinLock::new(0),
+            last_keys: IrqSpinLock::new([0; 6]),
+            last_buttons: IrqSpinLock::new(0),
+            last_touch: IrqSpinLock::new(None),
+            key_press_time: IrqSpinLock::new(0),
+            last_repeat_time: IrqSpinLock::new(0),
         }
     }
 
@@ -1192,7 +1192,7 @@ fn register_apple_spi_hid_driver() {
 
 scarlet::driver_initcall!(register_apple_spi_hid_driver);
 
-static REPEAT_REGISTRY: Mutex<Option<Arc<AppleSpiHidTransport>>> = Mutex::new(None);
+static REPEAT_REGISTRY: IrqSpinLock<Option<Arc<AppleSpiHidTransport>>> = IrqSpinLock::new(None);
 static REPEAT_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn ensure_repeat_worker_started() {

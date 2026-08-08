@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use scarlet::sync::Mutex;
+use scarlet::sync::IrqSpinLock;
 
 use scarlet::device::power::PowerManager;
 use scarlet::device::reset::ResetController;
@@ -117,7 +117,7 @@ struct PmgrInstance {
     /// Power domains managed by this PMGR block
     domains: BTreeMap<u32, ApplePmDomain>,
     /// Serializes PMGR register read-modify-write sequences.
-    register_lock: Mutex<()>,
+    register_lock: IrqSpinLock<()>,
 }
 
 impl PmgrInstance {
@@ -128,7 +128,7 @@ impl PmgrInstance {
             base_addr,
             size,
             domains: BTreeMap::new(),
-            register_lock: Mutex::new(()),
+            register_lock: IrqSpinLock::new(()),
         }
     }
 
@@ -356,7 +356,7 @@ impl ResetController for ApplePmDomain {
 /// Power domains are looked up by a composite key: (instance_index, domain_index).
 /// The `power-domains = <&pmgr N>` DT property provides N as the domain index
 /// within the referenced PMGR instance.
-static PMGR_REGISTRY: Mutex<Option<PmgrRegistry>> = Mutex::new(None);
+static PMGR_REGISTRY: IrqSpinLock<Option<PmgrRegistry>> = IrqSpinLock::new(None);
 
 /// Holds all registered PMGR instances, keyed by phandle.
 struct PmgrRegistry {
@@ -376,7 +376,7 @@ impl PmgrRegistry {
 }
 
 /// Get a reference to the global PMGR registry.
-fn get_registry() -> Option<scarlet::sync::MutexGuard<'static, Option<PmgrRegistry>>> {
+fn get_registry() -> Option<scarlet::sync::IrqSpinLockGuard<'static, Option<PmgrRegistry>>> {
     let guard = PMGR_REGISTRY.lock();
     if guard.is_some() { Some(guard) } else { None }
 }

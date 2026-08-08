@@ -64,6 +64,12 @@ Apple AVD/DART node をメモリ上で注入する。あわせて m1n1 proxy 経
 `/arm-io/dart-avd` と `/arm-io/avd` の PMGR power を enable する
 （古いローカル m1n1 では PMGR clocks enable にフォールバックする）。
 
+J293では同じpayload読込時に、固定のType-C DCPext構成もguest DTBへ注入する。
+これはlive ADTには依存せず、左手前Type-Cポート、DCPext alias、mailbox/DART、
+ATC1 PHY/crossbarをstage 2 m1n1がDTBを処理する前に有効化する。無効化する場合は
+`--dcpext-dtb-patch off`、パッチ失敗時に停止する場合は
+`--dcpext-dtb-patch require`を指定する。
+
 AVD DTB patch を必須にして失敗時に止める場合：
 
 ```bash
@@ -88,6 +94,7 @@ deploy_m1n1_usb.py
   ├─ UartInterface() 新規接続      (run_guest.py と同じ)
   ├─ ProxyUtils(heap_size=128MB)
   ├─ hv.init()                    (HV 初期化, vUART マップ)
+  ├─ DCPext DTB patch             (J293固定Type-C構成 → guest payload DTB)
   ├─ AVD DTB patch                (live ADT → guest payload DTB)
   ├─ PMGR power enable            (/arm-io/dart-avd, /arm-io/avd)
   ├─ hv.load_raw(boot-j293.bin)   (m1n1+DTB+U-Boot を HV ゲストとしてロード)

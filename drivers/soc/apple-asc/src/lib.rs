@@ -78,6 +78,8 @@ pub struct AppleAsc {
     base: usize,
     cpu_base: usize,
     interrupt_id: IrqSpinLock<Option<InterruptId>>,
+    tx_lock: IrqSpinLock<()>,
+    rx_lock: IrqSpinLock<()>,
     pending_messages: IrqSpinLock<VecDeque<AscMessage>>,
     recv_waker: Waker,
     rx_ready_handler: IrqSpinLock<Option<Arc<dyn AscRxReadyHandler>>>,
@@ -115,6 +117,8 @@ impl AppleAsc {
             base,
             cpu_base: base,
             interrupt_id: IrqSpinLock::new(None),
+            tx_lock: IrqSpinLock::new(()),
+            rx_lock: IrqSpinLock::new(()),
             pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
             rx_ready_handler: IrqSpinLock::new(None),
@@ -136,6 +140,8 @@ impl AppleAsc {
             base,
             cpu_base,
             interrupt_id: IrqSpinLock::new(None),
+            tx_lock: IrqSpinLock::new(()),
+            rx_lock: IrqSpinLock::new(()),
             pending_messages: IrqSpinLock::new(VecDeque::new()),
             recv_waker: Waker::new_uninterruptible("apple_asc_rx"),
             rx_ready_handler: IrqSpinLock::new(None),
@@ -186,6 +192,7 @@ impl AppleAsc {
 
     /// Check whether there is a pending IOP->AP message.
     pub fn can_recv(&self) -> bool {
+        let _rx_guard = self.rx_lock.lock();
         !self.pending_messages.lock().is_empty() || self.hardware_can_recv()
     }
 
@@ -193,10 +200,35 @@ impl AppleAsc {
     pub fn send(&self, msg: &AscMessage) -> Result<(), &'static str> {
         let start = time::current_time();
         loop {
-            // SAFETY: `self.base` points to a mapped ASC MMIO region.
-            let status = unsafe { mmio::read32(self.base + ASC_MBOX_A2I_CONTROL) };
-            if (status & ASC_MBOX_CTRL_FULL) == 0 {
-                break;
+            let sent = {
+                // Serialize only the FIFO check and two-register transaction.
+                // Waiting with this IRQ-safe lock held could block the receive
+                // interrupt needed by a coprocessor protocol peer.
+                let _tx_guard = self.tx_lock.lock();
+                // SAFETY: `self.base` points to a mapped ASC MMIO region.
+                let status = unsafe { mmio::read32(self.base + ASC_MBOX_A2I_CONTROL) };
+                if (status & ASC_MBOX_CTRL_FULL) != 0 {
+                    false
+                } else {
+                    // SAFETY: MMIO transaction ordering for ASC mailbox writes
+                    // requires dsb ish before publishing the register pair.
+                    unsafe {
+                        dsb_ish();
+                    }
+
+                    // SAFETY: `self.base` points to a mapped ASC MMIO region.
+                    // Holding `tx_lock` prevents another CPU from interleaving
+                    // its SEND0/SEND1 pair with this message.
+                    unsafe {
+                        mmio::write64(self.base + ASC_MBOX_A2I_SEND0, msg.msg0);
+                        mmio::write64(self.base + ASC_MBOX_A2I_SEND1, msg.msg1 as u64);
+                    }
+                    true
+                }
+            };
+
+            if sent {
+                return Ok(());
             }
 
             if time::current_time().saturating_sub(start) >= ASC_SEND_TIMEOUT_US {
@@ -205,31 +237,19 @@ impl AppleAsc {
 
             time::udelay(ASC_POLL_DELAY_US);
         }
-
-        // SAFETY: MMIO transaction ordering for ASC mailbox writes requires dsb ish.
-        unsafe {
-            dsb_ish();
-        }
-
-        // SAFETY: `self.base` points to a mapped ASC MMIO region.
-        unsafe {
-            mmio::write64(self.base + ASC_MBOX_A2I_SEND0, msg.msg0);
-            mmio::write64(self.base + ASC_MBOX_A2I_SEND1, msg.msg1 as u64);
-        }
-
-        Ok(())
     }
 
     /// Receive one IOP->AP message.
     pub fn recv(&self, msg: &mut AscMessage) -> Result<(), &'static str> {
+        let _rx_guard = self.rx_lock.lock();
         if let Some(pending) = self.pending_messages.lock().pop_front() {
             *msg = pending;
             return Ok(());
         }
-        self.recv_hardware(msg)
+        self.recv_hardware_unlocked(msg)
     }
 
-    fn recv_hardware(&self, msg: &mut AscMessage) -> Result<(), &'static str> {
+    fn recv_hardware_unlocked(&self, msg: &mut AscMessage) -> Result<(), &'static str> {
         if !self.hardware_can_recv() {
             return Err("apple-asc: no message available");
         }
@@ -252,8 +272,8 @@ impl AppleAsc {
     pub fn recv_timeout(&self, msg: &mut AscMessage, timeout_us: u64) -> Result<(), &'static str> {
         let start = time::current_time();
         loop {
-            if self.can_recv() {
-                return self.recv(msg);
+            if self.recv(msg).is_ok() {
+                return Ok(());
             }
 
             let elapsed = time::current_time().saturating_sub(start);
@@ -288,18 +308,22 @@ impl InterruptSource for AppleAsc {
     }
 
     fn claim_interrupt(&self) -> InterruptResult<InterruptClaim> {
-        if !self.hardware_can_recv() {
-            return Ok(InterruptClaim::NotMine);
-        }
-
-        let mut received = VecDeque::new();
-        while self.hardware_can_recv() {
-            let mut message = AscMessage { msg0: 0, msg1: 0 };
-            if self.recv_hardware(&mut message).is_err() {
-                break;
+        let mut received = {
+            let _rx_guard = self.rx_lock.lock();
+            if !self.hardware_can_recv() {
+                return Ok(InterruptClaim::NotMine);
             }
-            received.push_back(message);
-        }
+
+            let mut received = VecDeque::new();
+            while self.hardware_can_recv() {
+                let mut message = AscMessage { msg0: 0, msg1: 0 };
+                if self.recv_hardware_unlocked(&mut message).is_err() {
+                    break;
+                }
+                received.push_back(message);
+            }
+            received
+        };
         if received.is_empty() {
             return Ok(InterruptClaim::NotMine);
         }

@@ -11,7 +11,8 @@ extern crate alloc;
 
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec};
 use core::fmt;
-use scarlet::sync::{IrqSpinLock, IrqRwSpinLock};
+use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use scarlet::sync::{IrqRwSpinLock, IrqSpinLock};
 
 use scarlet::{
     arch::mmio,
@@ -80,6 +81,34 @@ const UFSTAT_RXFULL: u32 = 1 << 8;
 const UFSTAT_TXCNT_SHIFT: u32 = 4;
 const UFSTAT_TXCNT_MASK: u32 = 0xF0;
 const UFSTAT_RXCNT_MASK: u32 = 0x0F;
+
+// =============================================================================
+// Emergency console
+// =============================================================================
+
+const EMERGENCY_TX_RETRY_LIMIT: usize = 256;
+
+static EMERGENCY_UART_BASE: AtomicUsize = AtomicUsize::new(0);
+
+fn emergency_putc(byte: u8) {
+    let base = EMERGENCY_UART_BASE.load(AtomicOrdering::Acquire);
+    if base == 0 {
+        return;
+    }
+
+    for _ in 0..EMERGENCY_TX_RETRY_LIMIT {
+        // SAFETY: `base` is the permanently mapped S5L UART MMIO base
+        // published after the UART has been initialized successfully.
+        let ufstat = unsafe { mmio::read32(base + UFSTAT) };
+        if ufstat & UFSTAT_TXFULL == 0 {
+            // SAFETY: UTXH is the byte transmit register in the same permanent
+            // S5L UART MMIO mapping. This path intentionally takes no locks.
+            unsafe { mmio::write32(base + UTXH, byte as u32) };
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
 
 // =============================================================================
 // S5L UART Device
@@ -400,6 +429,18 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
 
     let uart = Arc::new(S5lUart::new(base_addr, uart_clk, baud_clk));
     uart.init();
+
+    if EMERGENCY_UART_BASE
+        .compare_exchange(
+            0,
+            base_addr,
+            AtomicOrdering::Release,
+            AtomicOrdering::Relaxed,
+        )
+        .is_ok()
+    {
+        scarlet::log::register_emergency_putc(emergency_putc);
+    }
 
     let irq_resources: alloc::vec::Vec<_> = device
         .get_resources()

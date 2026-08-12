@@ -21,7 +21,7 @@ use scarlet::device::manager::{DeviceManager, DriverPriority, probe_defer};
 use scarlet::device::platform::{PlatformDeviceDriver, PlatformDeviceInfo};
 use scarlet::device::spi::{SpiBus, SpiError, SpiTransfer};
 use scarlet::early_println;
-use scarlet::interrupt::{InterruptError, InterruptId, InterruptResult};
+use scarlet::interrupt::{InterruptId, InterruptResult};
 use scarlet::time::udelay;
 
 const PACKET_SIZE: usize = 256;
@@ -248,6 +248,7 @@ pub struct AppleSpiHidTransport {
     irq_gpio: (u32, Option<Arc<dyn scarlet::device::gpio::GpioController>>),
     irq_id: Option<InterruptId>,
     irq_trigger: GpioIrqTrigger,
+    irq_work_pending: AtomicBool,
     msg_id: IrqSpinLock<u8>,
     booted: IrqSpinLock<bool>,
     ready: IrqSpinLock<bool>,
@@ -280,6 +281,7 @@ impl AppleSpiHidTransport {
             irq_gpio,
             irq_id: None,
             irq_trigger,
+            irq_work_pending: AtomicBool::new(false),
             msg_id: IrqSpinLock::new(0),
             booted: IrqSpinLock::new(false),
             ready: IrqSpinLock::new(false),
@@ -977,39 +979,69 @@ impl AppleSpiHidTransport {
     }
 
     fn service_pending_reads(&self) -> Result<(), SpiError> {
-        for _ in 0..MAX_IRQ_DRAIN {
-            if !self.irq_line_active() {
+        let edge_triggered = matches!(
+            self.irq_trigger,
+            GpioIrqTrigger::RisingEdge | GpioIrqTrigger::FallingEdge
+        );
+        for attempt in 0..MAX_IRQ_DRAIN {
+            if (!edge_triggered || attempt != 0) && !self.irq_line_active() {
                 break;
             }
 
             if let Some((device_id, report)) = self.recv_report()? {
                 self.handle_input_report(device_id, &report);
             }
+
+            if edge_triggered {
+                break;
+            }
         }
 
         Ok(())
+    }
+
+    fn queue_interrupt_work(&self) {
+        self.disable_device_irq();
+        self.irq_work_pending.store(true, Ordering::Release);
+        SPI_HID_IRQ_WORKER_WAKER.wake_one();
+    }
+
+    fn process_deferred_interrupt_work(&self) -> bool {
+        if !self.irq_work_pending.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+
+        if !self.is_ready() {
+            return true;
+        }
+
+        if SPI_HID_VERBOSE_TRACE && IRQ_LOGS.fetch_add(1, Ordering::Relaxed) < IRQ_LOG_LIMIT {
+            early_println!(
+                "apple-spi-hid: deferred irq value={:?} active={} booted={} ready=true",
+                self.irq_line_value(),
+                self.irq_line_active(),
+                self.is_booted()
+            );
+        }
+        if let Err(error) = self.service_pending_reads() {
+            if IRQ_LOGS.fetch_add(1, Ordering::Relaxed) < IRQ_LOG_LIMIT {
+                early_println!("apple-spi-hid: deferred IRQ service failed: {:?}", error);
+            }
+        }
+
+        self.enable_device_irq();
+        true
     }
 }
 
 impl InterruptCapableDevice for AppleSpiHidTransport {
     fn handle_interrupt(&self) -> InterruptResult<()> {
-        let ready = self.is_ready();
-        if SPI_HID_VERBOSE_TRACE && IRQ_LOGS.fetch_add(1, Ordering::Relaxed) < IRQ_LOG_LIMIT {
-            early_println!(
-                "apple-spi-hid: irq value={:?} active={} booted={} ready={}",
-                self.irq_line_value(),
-                self.irq_line_active(),
-                self.is_booted(),
-                ready
-            );
-        }
-        if !ready {
+        if !self.is_ready() {
             self.disable_device_irq();
             return Ok(());
         }
 
-        self.service_pending_reads()
-            .map_err(|_| InterruptError::HardwareError)?;
+        self.queue_interrupt_work();
         Ok(())
     }
 
@@ -1168,6 +1200,7 @@ fn probe_fn(device: &PlatformDeviceInfo) -> Result<(), &'static str> {
         let mut reg = REPEAT_REGISTRY.lock();
         *reg = Some(transport.clone());
     }
+    ensure_irq_worker_started();
     ensure_repeat_worker_started();
 
     transport.enable_device_irq();
@@ -1193,7 +1226,43 @@ fn register_apple_spi_hid_driver() {
 scarlet::driver_initcall!(register_apple_spi_hid_driver);
 
 static REPEAT_REGISTRY: IrqSpinLock<Option<Arc<AppleSpiHidTransport>>> = IrqSpinLock::new(None);
+static SPI_HID_IRQ_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static SPI_HID_IRQ_WORKER_WAKER: scarlet::sync::Waker =
+    scarlet::sync::Waker::new_uninterruptible("spi-hid-irq");
 static REPEAT_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+fn ensure_irq_worker_started() {
+    if SPI_HID_IRQ_WORKER_STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let task = scarlet::task::new_kernel_task("spi-hid-irq".to_string(), 1, irq_worker_entry);
+    // Apple pinctrl routes this GPIO parent interrupt to CPU0. Keeping its worker
+    // there guarantees that the parent status is acknowledged before this task
+    // can re-enable the child GPIO interrupt.
+    task.set_pinned_cpu(Some(0));
+    task.init();
+    scarlet::sched::scheduler::add_task(task, 0);
+}
+
+fn irq_worker_entry() {
+    loop {
+        let transport = REPEAT_REGISTRY.lock().as_ref().cloned();
+        let processed =
+            transport.is_some_and(|transport| transport.process_deferred_interrupt_work());
+        if processed {
+            continue;
+        }
+
+        let Some(task) = scarlet::task::mytask() else {
+            scarlet::arch::instruction::idle();
+        };
+        SPI_HID_IRQ_WORKER_WAKER.wait(task.get_id(), task.get_trapframe());
+    }
+}
 
 fn ensure_repeat_worker_started() {
     if REPEAT_WORKER_STARTED

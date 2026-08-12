@@ -379,7 +379,6 @@ impl Aic {
                 }))
             }
             AIC_EVENT_TYPE_IPI => {
-                scarlet::early_println!("[AIC][IPI] cpu={} event_num={}", cpu_id, event_num);
                 match event_num {
                     AIC_EVENT_IPI_OTHER | AIC_EVENT_IPI_SELF => unsafe {
                         let ack_bit = if event_num == AIC_EVENT_IPI_OTHER {
@@ -493,6 +492,29 @@ impl ExternalInterruptController for Aic {
         Ok(())
     }
 
+    fn mask_irq(&self, irq: &PendingIrq) -> InterruptResult<()> {
+        if irq.mapping.hwirq == SOFTWARE_IPI_HWIRQ {
+            return Ok(());
+        }
+        self.disable_interrupt(irq.mapping.hwirq, irq.cpu_id)
+    }
+
+    fn unmask_irq(&self, irq: &PendingIrq) -> InterruptResult<()> {
+        if irq.mapping.hwirq == SOFTWARE_IPI_HWIRQ {
+            return Ok(());
+        }
+
+        self.validate_cpu_id(irq.cpu_id)?;
+        self.validate_interrupt_id(irq.mapping.hwirq)?;
+        let mask_addr = self.reg_addr(AIC_MASK_CLR + mask_reg(irq.mapping.hwirq));
+        // SAFETY: The validated hardware IRQ selects a MASK_CLR register in
+        // this live controller's mapped AIC MMIO region.
+        unsafe {
+            mmio::write32(mask_addr, mask_bit(irq.mapping.hwirq));
+        }
+        Ok(())
+    }
+
     /// Set priority for a specific interrupt.
     ///
     /// AIC has automatic prioritization (lower IRQ = higher priority).
@@ -560,7 +582,11 @@ impl ExternalInterruptController for Aic {
             return Ok(());
         }
 
-        self.complete_interrupt(irq.cpu_id, irq.mapping.hwirq)?;
+        self.validate_cpu_id(irq.cpu_id)?;
+        self.validate_interrupt_id(irq.mapping.hwirq)?;
+        // Reading AIC_EVENT acknowledges and auto-masks a hardware IRQ. AIC
+        // has no separate CPU-interface EOI write; the flow layer decides when
+        // it is safe to unmask through `unmask_irq`.
         // let eois = HARDWARE_IRQ_EOIS.fetch_add(1, Ordering::Relaxed) + 1;
         // let source_eois = HARDWARE_IRQ_EOIS_BY_ID
         //     .get(irq.mapping.hwirq as usize)

@@ -30,7 +30,6 @@ use scarlet::{
     },
     early_println,
     interrupt::InterruptId,
-    mem::pmm,
     sync::IrqSpinLock,
 };
 use scarlet_driver_apple_atcphy::get_atcphy_by_phandle;
@@ -65,6 +64,7 @@ const GUSB2PHYCFG_SUSPHY: u32 = 1 << 6;
 const GUSB2PHYCFG_PHYSOFTRST: u32 = 1 << 31;
 const GUSB3PIPECTL_SUSPHY: u32 = 1 << 17;
 const GUSB3PIPECTL_PHYSOFTRST: u32 = 1 << 31;
+const GEVNTSIZ_INTMASK: u32 = 1 << 31;
 
 /// Synopsys DWC3 core register access wrapper.
 pub struct Dwc3Core {
@@ -215,10 +215,12 @@ impl AppleDwc3 {
         let usb3cfg = self.core.read32(DWC3_GUSB3PIPECTL) | GUSB3PIPECTL_SUSPHY;
         self.core.write32(DWC3_GUSB3PIPECTL, usb3cfg);
 
-        let evt_paddr = pmm::alloc_frame().ok_or("dwc3: failed to alloc event buffer")?;
-        self.core.write32(DWC3_GEVNTADRLO, evt_paddr as u32);
-        self.core.write32(DWC3_GEVNTADRHI, (evt_paddr >> 32) as u32);
-        self.core.write32(DWC3_GEVNTSIZ, 0x1000);
+        // Host mode is serviced by the xHCI event ring. The DWC3 global event
+        // buffer belongs to the gadget/device path; enabling it here leaves a
+        // second, unserviced cause on the shared Apple DWC3/xHCI interrupt.
+        self.core.write32(DWC3_GEVNTADRLO, 0);
+        self.core.write32(DWC3_GEVNTADRHI, 0);
+        self.core.write32(DWC3_GEVNTSIZ, GEVNTSIZ_INTMASK);
         self.core.write32(DWC3_GEVNTCOUNT, 0);
 
         early_println!("[apple-dwc3] initialized (dr_mode={})", self.dr_mode);
